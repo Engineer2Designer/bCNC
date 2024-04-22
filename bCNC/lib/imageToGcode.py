@@ -814,7 +814,7 @@ class Image_Matrix_Numpy:
 
         self.width = width
         self.height = height
-        self.matrix = numpy.zeros((width, height), "Float32")
+        self.matrix = numpy.zeros((width, height), dtype=numpy.float32)
         self.shape = [width, height]
         self.t_offset = 0
 
@@ -832,7 +832,7 @@ class Image_Matrix_Numpy:
         self.width = s
         self.height = s
 
-        self.matrix = numpy.zeros((s, s), "Float32")
+        self.matrix = numpy.zeros((s, s), dtype=numpy.float32)
         for x in range(s):
             for y in range(s):
                 self.matrix[x, y] = float(input_list[x][y])
@@ -845,7 +845,7 @@ class Image_Matrix_Numpy:
 
         if pil_format:
             him, wim = im.size
-            self.matrix = numpy.zeros((wim, him), "Float32")
+            self.matrix = numpy.zeros((wim, him), dtype=numpy.float32)
             for i in range(0, wim):
                 for j in range(0, him):
                     pix = im.getpixel((j, i))
@@ -853,7 +853,7 @@ class Image_Matrix_Numpy:
         else:
             him = im.width()
             wim = im.height()
-            self.matrix = numpy.zeros((wim, him), "Float32")
+            self.matrix = numpy.zeros((wim, him), dtype=numpy.float32)
             for i in range(0, wim):
                 for j in range(0, him):
                     try:
@@ -877,7 +877,7 @@ class Image_Matrix_Numpy:
         w, h = self.shape
         w1 = w + ts - 1
         h1 = h + ts - 1
-        temp = numpy.zeros((w1, h1), "Float32")
+        temp = numpy.zeros((w1, h1), dtype=numpy.float32)
         for j in range(0, w1):
             for i in range(0, h1):
                 temp[j, i] = -1e1000000
