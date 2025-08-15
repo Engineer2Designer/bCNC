@@ -1330,7 +1330,7 @@ class Application(Tk, Sender):
     # ----------------------------------------------------------------------
     def draw(self):
         view = CNCCanvas.VIEWS.index(self.canvasFrame.view.get())
-        self.canvas.draw(view)
+        self.canvas.updateAll(view)
         self.selectionChange()
 
     # ----------------------------------------------------------------------
@@ -2263,7 +2263,8 @@ class Application(Tk, Sender):
         if not items:
             return
         self.canvas.select(items)
-        self.canvas.activeMarker(self.editor.getActive())
+        # TODO: Implement active marker
+        #self.canvas.activeMarker(self.editor.getActive())
 
     # -----------------------------------------------------------------------
     # Create a new file
