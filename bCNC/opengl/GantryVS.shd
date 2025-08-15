@@ -1,0 +1,14 @@
+// GLSL ES 1.00
+#version 100
+attribute vec3 xyz;
+attribute vec3 normal;
+
+uniform mat4 MVP;
+uniform vec3 location;
+
+varying vec3 normal_;
+
+void main() {
+    gl_Position = MVP * vec4(xyz + location, 1);
+    normal_ = normal;
+}
