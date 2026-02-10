@@ -260,7 +260,6 @@ class CNCCanvas(GLCanvas):
         self._inDraw = False  # semaphore for parsing
         self._gantry1 = None
         self._gantry2 = None
-        self._select = None
         self._margin = None
         self._amargin = None
         self._workarea = None
@@ -338,6 +337,8 @@ class CNCCanvas(GLCanvas):
         self.marginVertices = numpy.array([], dtype=numpy.float32)
         # Work Area
         self.workAreaVertices = numpy.array([], dtype=numpy.float32)
+        # Selection Rectangle
+        self.SelectionRectVertices = numpy.array([], dtype=numpy.float32)
         
         self.reset()
         self.initGL()
@@ -449,6 +450,23 @@ class CNCCanvas(GLCanvas):
         # Create a Vertex Buffer Object (VBO)
         self.marginsVBO = glGenBuffers(1)
         self.workAreaVBO = glGenBuffers(1)
+
+        # ----- SELECTION RECT PROGRAM ------
+        # Program to draw the selection rectangle
+        # Vertex Shader code
+        with open(openglFolder + "SelectionRectVS.shd", "r") as file:
+            SelectionRectVSCode = file.read()
+
+        # Fragment Shader code
+        with open(openglFolder + "SelectionRectFS.shd", "r") as file:
+            SelectionRectFSCode = file.read()
+
+        self.SelectionRectProgram = self.createProgram(SelectionRectVSCode, SelectionRectFSCode)
+        
+        # Create a Vertex Buffer Object (VBO)
+        self.SelectionRectVBO = glGenBuffers(1)
+
+
         
         glClearColor(1.0, 1.0, 1.0, 1.0)
         
@@ -905,24 +923,12 @@ class CNCCanvas(GLCanvas):
     # ----------------------------------------------------------------------
     def buttonMotion(self, event):
         if self._mouseAction == ACTION_SELECT_AREA:
-            """ self.coords(
-                self._select,
-                self.canvasx(self._x),
-                self.canvasy(self._y),
-                self.canvasx(event.x),
-                self.canvasy(event.y),
-            ) """
+            self.updateSelectionRect(self._x, self._y, event.x, event.y)
 
         elif self._mouseAction in (ACTION_SELECT_SINGLE, ACTION_SELECT_DOUBLE):
             if abs(event.x - self._x) > 4 or abs(event.y - self._y) > 4:
                 self._mouseAction = ACTION_SELECT_AREA
-                """ self._select = self.create_rectangle(
-                    self.canvasx(self._x),
-                    self.canvasy(self._y),
-                    self.canvasx(event.x),
-                    self.canvasy(event.y),
-                    outline=BOX_SELECT,
-                ) """
+                self.updateSelectionRect(self._x, self._y, event.x, event.y)
 
         elif self._mouseAction in (ACTION_MOVE, ACTION_RULER):
             coords = self.coords(self._vector)
@@ -957,6 +963,8 @@ class CNCCanvas(GLCanvas):
             self.pan(event)
 
         self.setMouseStatus(event)
+
+        self.queueDraw()
     
     def find_overlapping(self, x1, y1, x2, y2, lines):
         # Unit coordinates of the selection area boundaries
@@ -1032,25 +1040,32 @@ class CNCCanvas(GLCanvas):
             ACTION_SELECT_DOUBLE,
             ACTION_SELECT_AREA,
         ):
+            closest = numpy.array([])
+            
             if self._mouseAction == ACTION_SELECT_AREA:
                 if self._x < event.x:  # From left->right enclosed
-                    closest = self.find_enclosed(
-                        self.canvasx(self._x),
-                        self.canvasy(self._y),
-                        self.canvasx(event.x),
-                        self.canvasy(event.y),
-                    )
+                    try:
+                        closest = self.find_enclosed(
+                            self.canvasx(self._x),
+                            self.canvasy(self._y),
+                            self.canvasx(event.x),
+                            self.canvasy(event.y),
+                        )
+                    except Exception:
+                        pass
+
                 else:  # From right->left overlapping
-                    closest = self.find_overlapping(
-                        self._x,
-                        self._y,
-                        event.x,
-                        event.y,
-                        self.pathLines
-                    )
-                # TODO: hide the select area
-                #self.delete(self._select)
-                self._select = None
+                    try:
+                        closest = self.find_overlapping(
+                            self._x,
+                            self._y,
+                            event.x,
+                            event.y,
+                            self.pathLines
+                        )
+                    except Exception:
+                        pass
+
                 items = []
                 for i in closest:
                     try:
@@ -1060,11 +1075,15 @@ class CNCCanvas(GLCanvas):
 
             elif self._mouseAction in (ACTION_SELECT_SINGLE,
                                        ACTION_SELECT_DOUBLE):
-                closest = self.find_closest(
-                    self.canvasx(event.x),
-                    self.canvasy(event.y),
-                    CLOSE_DISTANCE
-                )
+                try:
+                    closest = self.find_closest(
+                        self.canvasx(event.x),
+                        self.canvasy(event.y),
+                        CLOSE_DISTANCE
+                    )
+                except Exception:
+                    pass
+
                 items = []
                 for i in closest:
                     try:
@@ -1075,15 +1094,15 @@ class CNCCanvas(GLCanvas):
                             self.selectMarker(i)
                             return
                         pass
-            if not items:
-                return
+            if items:
+                self.app.select(
+                    items,
+                    self._mouseAction == ACTION_SELECT_DOUBLE,
+                    event.state & CONTROL_MASK == 0,
+                )
 
-            self.app.select(
-                items,
-                self._mouseAction == ACTION_SELECT_DOUBLE,
-                event.state & CONTROL_MASK == 0,
-            )
             self._mouseAction = None
+            self.queueDraw()
 
         elif self._mouseAction == ACTION_MOVE:
             i = self.canvasx(event.x)
@@ -2013,6 +2032,31 @@ class CNCCanvas(GLCanvas):
         glDrawArrays(GL_TRIANGLES, 0, len(self.gantryVertices) // PARAMETERS_PER_VERTEX)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         
+        # Draw selection rectangle
+        if self._mouseAction == ACTION_SELECT_AREA:
+            glDisable(GL_CULL_FACE)
+            glUseProgram(self.SelectionRectProgram)
+            glBindBuffer(GL_ARRAY_BUFFER, self.SelectionRectVBO)
+            PARAMETERS_PER_VERTEX = 2
+            glVertexAttribPointer(glGetAttribLocation(self.SelectionRectProgram, "uv"), 2, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+            glEnableVertexAttribArray(glGetAttribLocation(self.SelectionRectProgram, "uv"))
+            
+            # Selection to the right -> Blue. To the left -> Green
+            if self.SelectionRectVertices[2] > self.SelectionRectVertices[0]:
+                rect_color = vec3(0, 0, 1)
+            else:
+                rect_color = vec3(0, 1, 0)
+            color_loc = glGetUniformLocation(program=self.SelectionRectProgram, name="color")
+            glUniform3fv(color_loc, 1, value_ptr(rect_color))
+            
+            glLineWidth(2)
+            glEnable(GL_LINE_SMOOTH)
+            glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
+            
+            glDrawArrays(GL_TRIANGLES, 0, len(self.SelectionRectVertices) // PARAMETERS_PER_VERTEX)
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+
         glUseProgram(0)
         
         self.swap_buffers()
@@ -2099,7 +2143,6 @@ class CNCCanvas(GLCanvas):
 
         self._lastInsert = None
         self._lastActive = None
-        self._select = None
         self._vector = None
         self._items.clear()
         self.cnc.initPath()
@@ -2198,6 +2241,25 @@ class CNCCanvas(GLCanvas):
         glBufferData(GL_ARRAY_BUFFER, self.axesVertices.nbytes, self.axesVertices, GL_STATIC_DRAW)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
 
+    # Update the selection rectangle
+    def updateSelectionRect(self, x1, y1, x2, y2):
+        glBindBuffer(GL_ARRAY_BUFFER, self.SelectionRectVBO)
+
+        p1 = self.canvas2Unit(vec2(x1, y1))
+        p2 = self.canvas2Unit(vec2(x2, y2))
+
+        self.SelectionRectVertices = numpy.array(
+            [p1.x, p1.y,
+             p2.x, p1.y,
+             p2.x, p2.y,
+             p1.x, p1.y,
+             p2.x, p2.y,
+             p1.x, p2.y],
+             dtype=numpy.float32)
+        
+        glBufferData(GL_ARRAY_BUFFER, self.SelectionRectVertices.nbytes, self.SelectionRectVertices, GL_STATIC_DRAW)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+    
     # ----------------------------------------------------------------------
     # Draw margins of selected blocks
     # ----------------------------------------------------------------------
