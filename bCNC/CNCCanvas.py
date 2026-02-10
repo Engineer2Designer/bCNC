@@ -2864,6 +2864,11 @@ class CanvasFrame(Frame):
 
         toolbar = Frame(self, relief=RAISED)
         toolbar.grid(row=0, column=0, columnspan=2, sticky=EW)
+
+        # Ensure the Frame exists at the OS level before OpenGL initializes
+        self.pack(side='top', fill='both', expand=True)
+        self.update()
+
         self.canvas = CNCCanvas(self, app, takefocus=True, background="White")
         # OpenGL context
         print(f"self.canvas.winfo_id(): {self.canvas.winfo_id()}")
