@@ -1598,6 +1598,10 @@ class CNCCanvas(GLCanvas):
                 
         self.updateMargin()
     
+    def deletePaths(self):
+        self.lines.clear()
+        self.update_buffer(self.pathVBO, self.lines)
+
     def deselectAll(self, linesArray, bufferToUpdate = None):
         linesArray16 = linesArray.reshape((-1, 16))
         mask = linesArray16[:, 7] > 0
@@ -1905,6 +1909,7 @@ class CNCCanvas(GLCanvas):
         
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT) # type: ignore
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glDisable(GL_DEPTH_TEST)
         glEnable(GL_BLEND)
         glEnable(GL_LINE_SMOOTH)
         glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
@@ -1952,6 +1957,7 @@ class CNCCanvas(GLCanvas):
         
         # Draw path
         if self.pathLines.size > 0:
+            glEnable(GL_DEPTH_TEST)
             glUseProgram(self.shader_program)
             glBindBuffer(GL_ARRAY_BUFFER, self.pathVBO)
             PARAMETERS_PER_VERTEX = 8
@@ -1979,6 +1985,7 @@ class CNCCanvas(GLCanvas):
         
         # Draw axes
         if self.draw_axes:
+            glDisable(GL_DEPTH_TEST)
             glUseProgram(self.axesProgram)
             glBindBuffer(GL_ARRAY_BUFFER, self.axesVBO)
             PARAMETERS_PER_VERTEX = 5
@@ -2136,7 +2143,10 @@ class CNCCanvas(GLCanvas):
     # ----------------------------------------------------------------------
     def initPosition(self):
         
+        # TODO: Anything apart from paths must be deleted...?
         #self.delete(ALL)
+        self.deletePaths()
+        
         self._cameraImage = None
         
         self.updateGantry(0, 0, 0)
