@@ -5,13 +5,12 @@ attribute vec3 xyz;
 attribute float length;
 attribute float colorValue;
 attribute float dashRatio;
-attribute float selected;
+attribute float flags;
 
 varying float id_;
 varying float length_;
 varying vec3 color;
 varying float dashRatio_;
-varying float selected_;
 
 uniform mat4 MVP;
 
@@ -22,12 +21,30 @@ void main() {
     if (id == -1.0) return;
     if (length == -1.0) return;
     if (dashRatio == -1.0) return;
-    gl_Position += vec4(selected * 0.00001);
 
+    // Apply a different color based on whether the path is selected/enabled
     // No bitwise operations in GLSL 1.0. So we use a workaround
-    float R = floor(colorValue / 65536.0);
-    float G = floor(mod(floor(colorValue / 256.0), 256.0)) * 256.0;
-    float B = mod(colorValue, 256.0);
+    bool isSelected = (mod(flags, 2.0) == 1.0);
+    bool isEnabled = (floor(mod(flags / 2.0, 2.0)) == 1.0);
 
-    color = vec3(R, G, B);
+    if (isSelected) {
+        if (isEnabled) {
+            color = vec3(0., 0., 1.);
+        }
+        else {
+            color = vec3(0., 0.535, 0.785);
+        }
+    }
+    else {
+        if (isEnabled) {
+            float R = floor(colorValue / 65536.0);
+            float G = floor(mod(floor(colorValue / 256.0), 256.0)) * 256.0;
+            float B = mod(colorValue, 256.0);
+
+            color = vec3(R, G, B);
+        }
+        else {
+            color = vec3(0.3, 0.3, 0.3);
+        }
+    }
 }

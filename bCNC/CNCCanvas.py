@@ -172,12 +172,12 @@ MOUSE_CURSOR = {
     ACTION_ADDORIENT: "tcross",
 }
 
-# Tags are stored in a float32 value for each vertex. 
-# Each tag is represented by a bit in that value. It can store up to 24 tags (24 representative bits in an integer float32)
-TAG_SEL = 0b1
-TAG_SEL2 = 0b10
-TAG_SEL3 = 0b100
-TAG_SEL4 = 0b1000
+# Path lines Flags are stored in a float32 value for each vertex. 
+# Each flag is represented by a bit in that value. It can store up to 24 tags (24 representative bits in an integer float32)
+FLAG_SELECTED = 0b1
+FLAG_ENABLED = 0b10
+#FLAG_XXX = 0b100
+#FLAG_XXX = 0b1000
 
 openglFolder = f"{os.path.abspath(os.path.dirname(__file__))}{os.sep}opengl{os.sep}"
 
@@ -499,9 +499,9 @@ class CNCCanvas(GLCanvas):
         
         return shader_program
         
-    def create_line(self, xyz, colorRGB, dashRatio, selected):
+    def create_line(self, xyz, colorRGB, dashRatio, flags):
         # xyz is an array of arrays of 3d coords
-        self.lines[self._line_id] = [xyz, colorRGB, dashRatio, selected]
+        self.lines[self._line_id] = [xyz, colorRGB, dashRatio, flags]
         
         id = self._line_id
         # Increment the line id for the next line
@@ -534,7 +534,7 @@ class CNCCanvas(GLCanvas):
                     0, # 0 for starting point, length for end point
                     colorValue, # RGB
                     data[2], # dashRatio
-                    data[3], # selected
+                    data[3], # flags
                     # Vertex 2
                     id,
                     xyz[i+1][0], # x1
@@ -543,7 +543,7 @@ class CNCCanvas(GLCanvas):
                     length,
                     colorValue, # RGB
                     data[2], # dashRatio
-                    data[3], # selected
+                    data[3], # flags
                 ])
                 
                 # TODO: Optimize this
@@ -1529,32 +1529,7 @@ class CNCCanvas(GLCanvas):
         if self._lastActive is not None:
             # TODO: self.itemconfig(self._lastActive, arrow=NONE)
             self._lastActive = None
-
-        for i in self.getSelected(self.pathLines, 1): #self.find_withtag("sel"):
-            bid, lid = self._items[i]
-            if bid:
-                try:
-                    block = self.gcode[bid]
-                    if block.color:
-                        fill = block.color
-                    else:
-                        fill = BLACK #ENABLE_COLOR
-                except IndexError:
-                    fill = BLACK #ENABLE_COLOR
-            else:
-                fill = BLACK #ENABLE_COLOR
-            #self.itemconfig(i, width=1, fill=fill)
-            self.setColorById(self.pathLines, i, fill)
         
-        self.setColorByTag(self.pathLines, TAG_SEL2, LIGHT_GRAY) #DISABLE_COLOR
-        self.setColorByTag(self.pathLines, TAG_SEL3, DARK_ORANGE) #TAB_COLOR
-        self.setColorByTag(self.pathLines, TAG_SEL4, LIGHT_GRAY) #DISABLE_COLOR
-        
-        """ self.itemconfig("sel2", width=1, fill=DISABLE_COLOR)
-        self.itemconfig("sel3", width=1, fill=TAB_COLOR)
-         self.itemconfig("sel4", width=1, fill=DISABLE_COLOR)"""
-        
-        # TODO: implement
         self.deselectAll(self.pathLines, self.pathVBO)
         """ for i in SELECTION_TAGS:
             self.dtag(i)
@@ -1564,68 +1539,33 @@ class CNCCanvas(GLCanvas):
     # Highlight selected items
     # ----------------------------------------------------------------------
     def select(self, items):
-        lineAndSel = []
+        linesAndFlags = []
         
         for b, i in items:
             block = self.gcode[b]
+            flags = FLAG_SELECTED | (FLAG_ENABLED if block.enable else 0)
+            
             if i is None:
-                #sel = block.enable and "sel" or "sel2"
-                sel = block.enable and 1 or 2
                 for path in block._path:
                     if path is not None:
-                        #self.addtag_withtag(sel, path)
-                        lineAndSel.append([path, sel])
-                #sel = block.enable and "sel3" or "sel4"
-                sel = block.enable and 3 or 4
+                        linesAndFlags.append([path, flags])
 
             elif isinstance(i, int):
                 path = block.path(i)
                 if path:
-                    #sel = block.enable and "sel" or "sel2"
-                    sel = block.enable and 1 or 2
-                    #self.addtag_withtag(sel, path)
-                    lineAndSel.append([path, sel])
+                    linesAndFlags.append([path, flags])
 
         """ 
             self.tag_raise(i) """
         
-        self.setSelected(self.pathLines, lineAndSel, None)
-        
-        self.setColorByTag(self.pathLines, TAG_SEL, BLUE, None)
-        self.setColorByTag(self.pathLines, TAG_SEL2, DARK_CYAN, None)
-        self.setColorByTag(self.pathLines, TAG_SEL3, DARK_ORANGE, None)
-        self.setColorByTag(self.pathLines, TAG_SEL4, ORANGE, self.pathVBO) # We just update the buffer in the last command
+        self.setFlags(self.pathLines, FLAG_SELECTED | FLAG_ENABLED, linesAndFlags, self.pathVBO)
                 
         self.updateMargin()
     
-    def deletePaths(self):
-        self.lines.clear()
-        self.update_buffer(self.pathVBO, self.lines)
-
-    def deselectAll(self, linesArray, bufferToUpdate = None):
-        linesArray16 = linesArray.reshape((-1, 16))
-        mask = linesArray16[:, 7] > 0
-        
-        linesArray16[mask, 7] = 0
-        linesArray16[mask, 15] = 0
-        
-        if bufferToUpdate:
-            glBindBuffer(GL_ARRAY_BUFFER, bufferToUpdate)
-            glBufferSubData(GL_ARRAY_BUFFER, 0, linesArray.nbytes, linesArray)
-            glBindBuffer(GL_ARRAY_BUFFER, 0)
-            self.queueDraw()
-
-    def getSelected(self, linesArray, sel):
-        linesArray16 = linesArray.reshape((-1, 16))
-        
-        mask = linesArray16[:, 7] == sel
-        
-        return numpy.unique(linesArray16[mask, 0].reshape((-1))).tolist()
-    
-    def setSelected(self, linesArray, lineAndSel, bufferToUpdate = None):
-        # lineAndSel must be an array of arrays (nx2)
-        # The first item of each array is the line number, and the second item 1-4, depending on the selection tag (sel, sel2, sel3, sel4)
-        selections = numpy.array(lineAndSel, dtype=numpy.float32).reshape((-1, 2))
+    def setFlags(self, linesArray, flagsToModify, linesAndFlags, bufferToUpdate = None):
+        # linesAndTags must be an array of arrays (nx2)
+        # The first item of each array is the line number, and the second item the value with the Tags to be activated
+        selections = numpy.array(linesAndFlags, dtype=numpy.float32).reshape((-1, 2))
         lookup = dict(selections)
         
         linesArray16 = linesArray.reshape((-1, 16))
@@ -1634,42 +1574,35 @@ class CNCCanvas(GLCanvas):
         matched_keys = linesArray16[mask, 0]
         
         # Since linesArray16 is a reshaped view of linesArray, changes are reflected in the original array
-        linesArray16[mask, 7] = numpy.vectorize(lookup.get)(matched_keys)
-        linesArray16[mask, 15] = numpy.vectorize(lookup.get)(matched_keys)
+        # First, clear the bits
+        linesArray16[mask, 7] = linesArray16[mask, 7].astype(int) & ~flagsToModify
+        linesArray16[mask, 15] = linesArray16[mask, 15].astype(int) & ~flagsToModify
+        # Then, set the ones to modify
+        linesArray16[mask, 7] = linesArray16[mask, 7].astype(int) | ((numpy.vectorize(lookup.get)(matched_keys)).astype(int) & flagsToModify)
+        linesArray16[mask, 15] = linesArray16[mask, 15].astype(int) | ((numpy.vectorize(lookup.get)(matched_keys)).astype(int) & flagsToModify)
         
         if bufferToUpdate:
             glBindBuffer(GL_ARRAY_BUFFER, bufferToUpdate)
             glBufferSubData(GL_ARRAY_BUFFER, 0, linesArray.nbytes, linesArray)
             glBindBuffer(GL_ARRAY_BUFFER, 0)
             self.queueDraw()
-        
-    def setColorByTag(self, linesArray, tag, colorValue, bufferToUpdate = None):
+
+    def deletePaths(self):
+        self.lines.clear()
+        self.update_buffer(self.pathVBO, self.lines)
+
+    def deselectAll(self, linesArray, bufferToUpdate = None):
         linesArray16 = linesArray.reshape((-1, 16))
         
-        # Since linesArray16 is a reshaped view of linesArray, changes are reflected in the original array
-        mask = (linesArray16[:, 7].astype(int) & tag) > 0
-        linesArray16[mask, 5] = colorValue
-        linesArray16[mask, 13] = colorValue
+        linesArray16[:, 7] = linesArray16[:, 7].astype(int) & ~FLAG_SELECTED
+        linesArray16[:, 15] = linesArray16[:, 15].astype(int) & ~FLAG_SELECTED
         
         if bufferToUpdate:
             glBindBuffer(GL_ARRAY_BUFFER, bufferToUpdate)
             glBufferSubData(GL_ARRAY_BUFFER, 0, linesArray.nbytes, linesArray)
             glBindBuffer(GL_ARRAY_BUFFER, 0)
             self.queueDraw()
-        
-    def setColorById(self, linesArray, id, colorValue, bufferToUpdate = None):
-        linesArray16 = linesArray.reshape((-1, 16))
-        
-        # Since linesArray16 is a reshaped view of linesArray, changes are reflected in the original array
-        mask = linesArray16[:, 0] == id
-        linesArray16[mask, 5] = colorValue
-        linesArray16[mask, 13] = colorValue
-        
-        if bufferToUpdate:
-            glBindBuffer(GL_ARRAY_BUFFER, bufferToUpdate)
-            glBufferSubData(GL_ARRAY_BUFFER, 0, linesArray.nbytes, linesArray)
-            glBindBuffer(GL_ARRAY_BUFFER, 0)
-            self.queueDraw()
+    
     # ----------------------------------------------------------------------
     # Select orientation marker
     # ----------------------------------------------------------------------
@@ -1966,13 +1899,13 @@ class CNCCanvas(GLCanvas):
             glVertexAttribPointer(glGetAttribLocation(self.shader_program, "length"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(4*4))
             glVertexAttribPointer(glGetAttribLocation(self.shader_program, "colorValue"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(5*4))
             glVertexAttribPointer(glGetAttribLocation(self.shader_program, "dashRatio"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(6*4))
-            glVertexAttribPointer(glGetAttribLocation(self.shader_program, "selected"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(7*4))
+            glVertexAttribPointer(glGetAttribLocation(self.shader_program, "flags"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(7*4))
             glEnableVertexAttribArray(glGetAttribLocation(self.shader_program, "id"))
             glEnableVertexAttribArray(glGetAttribLocation(self.shader_program, "xyz"))
             glEnableVertexAttribArray(glGetAttribLocation(self.shader_program, "length"))
             glEnableVertexAttribArray(glGetAttribLocation(self.shader_program, "colorValue"))
             glEnableVertexAttribArray(glGetAttribLocation(self.shader_program, "dashRatio"))
-            glEnableVertexAttribArray(glGetAttribLocation(self.shader_program, "selected"))
+            glEnableVertexAttribArray(glGetAttribLocation(self.shader_program, "flags"))
 
 
             MVP = self.PMatrix * self.MVMatrix
@@ -2105,7 +2038,6 @@ class CNCCanvas(GLCanvas):
         self.after('idle', self.draw)
         
     def updateAll(self, view=None):
-        
 
         self.make_current()
         
@@ -2137,6 +2069,8 @@ class CNCCanvas(GLCanvas):
         dy = int(round(self.canvasy(self.winfo_height() / 2) - ij[1]))
         self.scan_mark(0, 0)
         self.scan_dragto(int(round(dx)), int(round(dy)), 1) """
+
+        self.queueDraw()
 
     # ----------------------------------------------------------------------
     # Initialize gantry position
@@ -2817,27 +2751,33 @@ class CNCCanvas(GLCanvas):
             if self.cnc.gcode in (1, 2, 3):
                 block.pathMargins(xyz)
                 self.cnc.pathMargins(block)
+            
+            flags = 0
+
             if block.enable:
+                flags |= FLAG_ENABLED
+
                 if self.cnc.gcode == 0 and self.draw_rapid:
                     xyz[0] = self._last
                 self._last = xyz[-1]
+
             else:
                 if self.cnc.gcode == 0:
-                    return None
-            coords = True #self.plotCoords(xyz)
-            if coords:
-                if block.enable:
-                    if block.color:
-                        fill = block.color
-                    else:
-                        fill = ENABLE_COLOR
-                else:
-                    fill = DISABLE_COLOR
-                if self.cnc.gcode == 0:
-                    if self.draw_rapid:
-                        return self.create_line(xyz, (255, 0, 0), 0.5, 0)#return self.create_line(coords, fill=fill, width=0, dash=(4, 3))
-                elif self.draw_paths:
-                    return self.create_line(xyz, (numpy.array(self.winfo_rgb(fill)) * 255. / 65535.).astype(int), 1, 0) #fill=fill, width=0, cap="projecting")
+                    return None                
+
+            if block.color:
+                fill = block.color
+                
+            else:
+                fill = ENABLE_COLOR
+
+            if self.cnc.gcode == 0:
+                if self.draw_rapid:
+                    return self.create_line(xyz, (255, 0, 0), 0.5, flags)
+                
+            elif self.draw_paths:
+                return self.create_line(xyz, (numpy.array(self.winfo_rgb(fill)) * 255. / 65535.).astype(int), 1, flags)
+            
         return None
 
     # ----------------------------------------------------------------------
