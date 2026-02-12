@@ -1038,8 +1038,113 @@ class CNCCanvas(GLCanvas):
         
         return selectedIds
         
+    def find_enclosed(self, x1, y1, x2, y2, lines):
+        # Unit coordinates of the selection area boundaries
+        xy1 = self.canvas2Unit(vec2(x1, y1))
+        xy2 = self.canvas2Unit(vec2(x2, y2))
+
+        xmin = min(xy1.x, xy2.x)
+        xmax = max(xy1.x, xy2.x)
+        ymin = min(xy1.y, xy2.y)
+        ymax = max(xy1.y, xy2.y)
+        
+        # lines is a numpy array containing data for n lines
+        # It has a size of 16·n, dtype=float32
+        # It contains alternatively the starting and end point of a line in World coordinates.
+        # A point is defined with 8 float32 numbers
+        
+        points = (numpy.reshape(lines, (-1, 8))[:, 1:4]).reshape((-1, 3))# x,y,z
+        additionalColumn = numpy.ones((points.shape[0], 1), dtype=numpy.float32)
+        
+        points = numpy.hstack((points, additionalColumn)).reshape((-1, 4))
+
+        # Change world coordinates of the line points to canvas unit coords
+        MVP = numpy.array(self.PMatrix * self.MVMatrix)
+        
+        pointsCanvasUnit = (MVP @ points.T).T
+        
+        # Keep just x and y. Reshape to have starting and end point of each line in the same row
+        linesCanvasUnit = pointsCanvasUnit[:, :2].reshape((-1, 4))
+
+        # Boolean mask for both endpoints inside
+        mask = (
+            (linesCanvasUnit[:, 0] >= xmin) & (linesCanvasUnit[:, 0] <= xmax) &
+            (linesCanvasUnit[:, 1] >= ymin) & (linesCanvasUnit[:, 1] <= ymax) &
+            (linesCanvasUnit[:, 2] >= xmin) & (linesCanvasUnit[:, 2] <= xmax) &
+            (linesCanvasUnit[:, 3] >= ymin) & (linesCanvasUnit[:, 3] <= ymax)
+        )
+
+        lines_16 = numpy.reshape(lines, (-1, 16))[:, 0]
+        
+        return numpy.unique(lines_16[mask]).tolist() 
+    
+    def find_closest(self, x, y, lines, tolerance):
+        # Unit coordinates of the selection area boundaries
+        xy = self.canvas2Unit(vec2(x, y))
+
+        # tolerance in unit distance
+        unitTolX = tolerance / self.winfo_width() * 2
+        unitTolY = tolerance / self.winfo_height() * 2
+        
+        xmin = xy.x - unitTolX
+        xmax = xy.x + unitTolX
+        ymin = xy.y - unitTolY
+        ymax = xy.y + unitTolY
+        
+        # lines is a numpy array containing data for n lines
+        # It has a size of 16·n, dtype=float32
+        # It contains alternatively the starting and end point of a line in World coordinates.
+        # A point is defined with 8 float32 numbers
+        
+        points = (numpy.reshape(lines, (-1, 8))[:, 1:4]).reshape((-1, 3))# x,y,z
+        additionalColumn = numpy.ones((points.shape[0], 1), dtype=numpy.float32)
+        
+        points = numpy.hstack((points, additionalColumn)).reshape((-1, 4))
+
+        # Change world coordinates of the line points to canvas unit coords
+        MVP = numpy.array(self.PMatrix * self.MVMatrix)
+        
+        pointsCanvasUnit = (MVP @ points.T).T
+        
+        # Keep just x and y. Reshape to have starting and end point of each line in the same row
+        linesCanvasUnit = pointsCanvasUnit[:, :2].reshape((-1, 4))
         
         
+        # TODO: Mention the algorithm used here
+
+        dx = linesCanvasUnit[:, 2] - linesCanvasUnit[:, 0]
+        dy = linesCanvasUnit[:, 3] - linesCanvasUnit[:, 1]
+
+        p = numpy.stack([-dx, dx, -dy, dy], axis=1)  # shape (N, 4)
+        q = numpy.stack([linesCanvasUnit[:, 0] - xmin, xmax - linesCanvasUnit[:, 0],
+                    linesCanvasUnit[:, 1] - ymin, ymax - linesCanvasUnit[:, 1]], axis=1)
+
+        with numpy.errstate(divide='ignore', invalid='ignore'):
+            r = q / p  # shape (N, 4)
+
+        # Identify conditions
+        mask_neg = p < 0
+        mask_pos = p > 0
+        mask_zero_and_q_neg = (p == 0) & (q < 0)
+        any_outside = numpy.any(mask_zero_and_q_neg, axis=1)
+
+        # Initialize u1 and u2
+        u1 = numpy.where(mask_neg, r, 0.0)
+        u2 = numpy.where(mask_pos, r, 1.0)
+
+        u1_max = numpy.max(u1, axis=1)
+        u2_min = numpy.min(u2, axis=1)
+
+        intersects = (u1_max <= u2_min) & ~any_outside
+        
+        # Get the ids of the overlapped lines (id is the 1st parameter of the lines array)
+        lineIds = lines.reshape((-1, 16))[:, 0]
+        
+        selectedIds = numpy.unique(lineIds[intersects]).tolist()
+        
+        # TODO: Return the closest one, not the first in the list...
+        return [selectedIds[0]]
+    
     # ----------------------------------------------------------------------
     # Canvas release button1. Select area
     # ----------------------------------------------------------------------
@@ -1055,10 +1160,11 @@ class CNCCanvas(GLCanvas):
                 if self._x < event.x:  # From left->right enclosed
                     try:
                         closest = self.find_enclosed(
-                            self.canvasx(self._x),
-                            self.canvasy(self._y),
-                            self.canvasx(event.x),
-                            self.canvasy(event.y),
+                            self._x,
+                            self._y,
+                            event.x,
+                            event.y,
+                            self.pathLines
                         )
                     except Exception:
                         pass
@@ -1086,8 +1192,9 @@ class CNCCanvas(GLCanvas):
                                        ACTION_SELECT_DOUBLE):
                 try:
                     closest = self.find_closest(
-                        self.canvasx(event.x),
-                        self.canvasy(event.y),
+                        event.x,
+                        event.y,
+                        self.pathLines,
                         CLOSE_DISTANCE
                     )
                 except Exception:
