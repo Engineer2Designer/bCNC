@@ -29,22 +29,22 @@ void main() {
 
     if (isSelected) {
         if (isEnabled) {
-            color = vec3(0., 0., 1.);
+            color = vec3(0., 0., 1.); // BLUE
         }
         else {
-            color = vec3(0., 0.535, 0.785);
+            color = vec3(0., 0.543, 0.543); // DARK_CYAN
         }
     }
     else {
         if (isEnabled) {
             float R = floor(colorValue / 65536.0);
-            float G = floor(mod(floor(colorValue / 256.0), 256.0)) * 256.0;
+            float G = floor(mod(floor(colorValue / 256.0), 256.0));
             float B = mod(colorValue, 256.0);
 
-            color = vec3(R, G, B);
+            color = vec3(R, G, B) / 256.;
         }
         else {
-            color = vec3(0.3, 0.3, 0.3);
+            color = vec3(0.3, 0.3, 0.3); // GRAY
         }
     }
 }

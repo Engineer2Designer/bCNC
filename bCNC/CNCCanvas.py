@@ -7,6 +7,12 @@ import math
 import time
 import sys
 from tkinter_gl import GLCanvas
+
+import OpenGL
+if sys.platform == 'linux':
+    # PyOpenGL is broken with wayland:
+    OpenGL.setPlatform('x11')
+
 from OpenGL.GL import *
 from ctypes import c_void_p
 from pyglm.glm import mat4x4, ortho, identity, value_ptr, inverse, translate, rotate, vec2, vec3, vec4, inverse, normalize, lookAt
@@ -247,7 +253,7 @@ class CNCCanvas(GLCanvas):
 
         self.x0 = 0.0
         self.y0 = 0.0
-        self.zoom = 1.0
+        self.zoom = 1.
         self.__tzoom = 1.0  # delayed zoom (temporary)
         self._items = {}
         self._viewCenterX = 0
@@ -323,7 +329,7 @@ class CNCCanvas(GLCanvas):
         self.lines = {}
         self.pathLines = numpy.array([], dtype=numpy.float32)
         self._modelCenter = vec3(0, 0, 0)
-        self._modelSize = 1000.0
+        self._modelSize = 100.0
         # Background gradiend colors
         self.bgColorUp = vec3(0.175, 0.215, 0.392)
         self.bgColorDn = vec3(0.4, 0.4, 0.6)
@@ -556,7 +562,7 @@ class CNCCanvas(GLCanvas):
 
         if len(vertexData) == 0:
             self._modelCenter = vec3(0, 0, 0)
-            self._modelSize = 1
+            self._modelSize = 100
         else:
             self._modelCenter = vec3((maxX + minX) / 2, (maxY + minY) / 2, (maxZ + minZ) / 2)
             self._modelSize = math.sqrt(math.pow(maxX-minX, 2) + math.pow(maxY-minY, 2) + math.pow(maxZ-minZ, 2))
@@ -896,20 +902,23 @@ class CNCCanvas(GLCanvas):
         self._mouseY = event.y
     
     def rotate(self, event):
-        # Rotate about the model Center
         if (self._mouseX == event.x and self._mouseY == event.y):
             return
         
         RotAxis = normalize(vec4(event.y - self._mouseY, event.x - self._mouseX, 0, 0))
         
         RotAxis = inverse(self.MVMatrix) * RotAxis
-        self.MVMatrix = translate(self.MVMatrix, self._modelCenter)
+
+        # Rotate about the Center of the screen
+        rotationCenter = self.canvas2World(vec2(self.winfo_width() / 2., self.winfo_height() / 2.))
+
+        self.MVMatrix = translate(self.MVMatrix, rotationCenter)
 
         self.MVMatrix = rotate(self.MVMatrix,
             0.01 * math.sqrt(pow(event.y - self._mouseY, 2) + math.pow(event.x - self._mouseX, 2)),
             vec3(RotAxis.x, RotAxis.y, RotAxis.z)) # type: ignore
 
-        self.MVMatrix = translate(self.MVMatrix, -self._modelCenter)
+        self.MVMatrix = translate(self.MVMatrix, -rotationCenter)
         
         self._mouseX = event.x
         self._mouseY = event.y
@@ -1578,14 +1587,15 @@ class CNCCanvas(GLCanvas):
         linesArray16[mask, 7] = linesArray16[mask, 7].astype(int) & ~flagsToModify
         linesArray16[mask, 15] = linesArray16[mask, 15].astype(int) & ~flagsToModify
         # Then, set the ones to modify
-        linesArray16[mask, 7] = linesArray16[mask, 7].astype(int) | ((numpy.vectorize(lookup.get)(matched_keys)).astype(int) & flagsToModify)
-        linesArray16[mask, 15] = linesArray16[mask, 15].astype(int) | ((numpy.vectorize(lookup.get)(matched_keys)).astype(int) & flagsToModify)
+        if matched_keys.size > 0:
+            linesArray16[mask, 7] = linesArray16[mask, 7].astype(int) | ((numpy.vectorize(lookup.get)(matched_keys)).astype(int) & flagsToModify)
+            linesArray16[mask, 15] = linesArray16[mask, 15].astype(int) | ((numpy.vectorize(lookup.get)(matched_keys)).astype(int) & flagsToModify)
         
-        if bufferToUpdate:
-            glBindBuffer(GL_ARRAY_BUFFER, bufferToUpdate)
-            glBufferSubData(GL_ARRAY_BUFFER, 0, linesArray.nbytes, linesArray)
-            glBindBuffer(GL_ARRAY_BUFFER, 0)
-            self.queueDraw()
+            if bufferToUpdate:
+                glBindBuffer(GL_ARRAY_BUFFER, bufferToUpdate)
+                glBufferSubData(GL_ARRAY_BUFFER, 0, linesArray.nbytes, linesArray)
+                glBindBuffer(GL_ARRAY_BUFFER, 0)
+                self.queueDraw()
 
     def deletePaths(self):
         self.lines.clear()
@@ -3136,7 +3146,44 @@ class CanvasFrame(Frame):
 
     # ----------------------------------------------------------------------
     def viewChange(self, a=None, b=None, c=None):
-        self.event_generate("<<ViewChange>>")
+        # TODO: Change the view without fitting the screen. Show the current area instead
+        view = VIEWS.index(self.view.get())
+
+        self.canvas.MVMatrix = mat4x4(self.canvas.MVMatrix)
+
+        if view == 0:
+            self.canvas.MVMatrix = lookAt(
+                vec3(0, 0, 1),
+                vec3(0, 0, 0),
+                vec3(0, 1, 0))
+        elif view == 1:
+            self.canvas.MVMatrix = lookAt(
+                vec3(0, -1, 0),
+                vec3(0, 0, 0),
+                vec3(0, 0, 1))
+        elif view == 2:
+            self.canvas.MVMatrix = lookAt(
+                vec3(1, 0, 0),
+                vec3(0, 0, 0),
+                vec3(0, 0, 1))
+        elif view == 3:
+            self.canvas.MVMatrix = lookAt(
+                vec3(1, -1, 1),
+                vec3(0, 0, 0),
+                vec3(0, 0, 1))
+        elif view == 4:
+            self.canvas.MVMatrix = lookAt(
+                vec3(-1, -1, 1),
+                vec3(0, 0, 0),
+                vec3(0, 0, 1))
+        elif view == 5:
+            self.canvas.MVMatrix = lookAt(
+                vec3(-1, 1, 1),
+                vec3(0, 0, 0),
+                vec3(0, 0, 1))
+        
+        #self.event_generate("<<ViewChange>>")
+        self.canvas.fit2Screen()
 
     # ----------------------------------------------------------------------
     def viewXY(self, event=None):
