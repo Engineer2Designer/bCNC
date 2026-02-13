@@ -15,7 +15,7 @@ if sys.platform == 'linux':
 
 from OpenGL.GL import *
 from ctypes import c_void_p
-from pyglm.glm import mat4x4, ortho, identity, value_ptr, inverse, translate, rotate, vec2, vec3, vec4, inverse, normalize, lookAt
+from pyglm.glm import mat4x4, mat3x3, ortho, identity, value_ptr, inverse, translate, rotate, vec2, vec3, vec4, inverse, normalize, lookAt, dot, distance
 import os
 
 from tkinter import (
@@ -225,7 +225,7 @@ class CNCCanvas(GLCanvas):
 
         self.bind("<Button-2>", self.midClick)
         self.bind("<B2-Motion>", self.pan)
-        self.bind("<ButtonRelease-2>", self.panRelease)
+        self.bind("<ButtonRelease-2>", self.midRelease)
         self.bind("<Button-4>", self.mouseZoomIn)
         self.bind("<Button-5>", self.mouseZoomOut)
         self.bind("<MouseWheel>", self.wheel)
@@ -894,18 +894,18 @@ class CNCCanvas(GLCanvas):
             self.pan(event)
 
     def midClick(self, event):
-        self._mouseX = event.x
-        self._mouseY = event.y
+        self._x = event.x
+        self._y = event.y
     
     def rightClick(self, event):
-        self._mouseX = event.x
-        self._mouseY = event.y
+        self._x = event.x
+        self._y = event.y
     
     def rotate(self, event):
-        if (self._mouseX == event.x and self._mouseY == event.y):
+        if (self._x == event.x and self._y == event.y):
             return
         
-        RotAxis = normalize(vec4(event.y - self._mouseY, event.x - self._mouseX, 0, 0))
+        RotAxis = normalize(vec4(event.y - self._y, event.x - self._x, 0, 0))
         
         RotAxis = inverse(self.MVMatrix) * RotAxis
 
@@ -915,13 +915,13 @@ class CNCCanvas(GLCanvas):
         self.MVMatrix = translate(self.MVMatrix, rotationCenter)
 
         self.MVMatrix = rotate(self.MVMatrix,
-            0.01 * math.sqrt(pow(event.y - self._mouseY, 2) + math.pow(event.x - self._mouseX, 2)),
+            0.01 * math.sqrt(pow(event.y - self._y, 2) + math.pow(event.x - self._x, 2)),
             vec3(RotAxis.x, RotAxis.y, RotAxis.z)) # type: ignore
 
         self.MVMatrix = translate(self.MVMatrix, -rotationCenter)
         
-        self._mouseX = event.x
-        self._mouseY = event.y
+        self._x = event.x
+        self._y = event.y
         
         self.cameraPosition()
         
@@ -1078,7 +1078,7 @@ class CNCCanvas(GLCanvas):
         
         return numpy.unique(lines_16[mask]).tolist() 
     
-    def find_closest(self, x, y, lines, tolerance):
+    def find_closest(self, x, y, lines, tolerance, returnIndex = False):
         # Unit coordinates of the selection area boundaries
         xy = self.canvas2Unit(vec2(x, y))
 
@@ -1137,13 +1137,28 @@ class CNCCanvas(GLCanvas):
 
         intersects = (u1_max <= u2_min) & ~any_outside
         
-        # Get the ids of the overlapped lines (id is the 1st parameter of the lines array)
-        lineIds = lines.reshape((-1, 16))[:, 0]
-        
-        selectedIds = numpy.unique(lineIds[intersects]).tolist()
-        
         # TODO: Return the closest one, not the first in the list...
-        return [selectedIds[0]]
+
+        # If returnIndex is True, return the index of the closest line in the lines array, instead of the closest line ID
+        if returnIndex:
+            indices = numpy.arange(lines.size / 16)
+            selectedIndices = indices[intersects].tolist()
+
+            if len(selectedIndices) == 0:
+                return None
+            else:
+                return selectedIndices[0]
+            
+        else:
+            # Get the ids of the overlapped lines (id is the 1st parameter of the lines array)
+            lineIds = lines.reshape((-1, 16))[:, 0]
+            
+            selectedIds = numpy.unique(lineIds[intersects]).tolist()
+            
+            if len(selectedIds) == 0:
+                return []
+            else:
+                return [selectedIds[0]]
     
     # ----------------------------------------------------------------------
     # Canvas release button1. Select area
@@ -1231,7 +1246,7 @@ class CNCCanvas(GLCanvas):
             self.app.insertCommand(("move %g %g %g") % (dx, dy, dz), True)
 
         elif self._mouseAction == ACTION_PAN:
-            self.panRelease(event)
+            self.midRelease(event)
 
     # ----------------------------------------------------------------------
     def double(self, event):
@@ -1331,16 +1346,59 @@ class CNCCanvas(GLCanvas):
         self.cameraPosition()
         self.queueDraw()
 
+    def closest_points_between_lines(self, P1, P2, Q1, Q2, eps=1e-9):
+        """
+        Compute closest points between two infinite 3D lines.
+
+        Line 1: P1 + t*(P2-P1)
+        Line 2: Q1 + u*(Q2-Q1)
+
+        Returns:
+            C1 : closest point on line 1
+            C2 : closest point on line 2
+            distance : minimum distance between lines
+            intersect : True if lines intersect (within tolerance)
+        """
+
+        r = P2 - P1
+        s = Q2 - Q1
+        w0 = P1 - Q1
+
+        a = dot(r, r)
+        b = dot(r, s)
+        c = dot(s, s)
+        d = dot(r, w0)
+        e = dot(s, w0)
+
+        denom = a * c - b * b
+
+        # If denom is zero, lines are parallel
+        if abs(denom) < eps:
+            # choose arbitrary t = 0
+            t = 0.0
+            u = e / c if c > eps else 0.0
+        else:
+            t = (b * e - c * d) / denom
+            u = (a * e - b * d) / denom
+
+        C1 = P1 + t * r
+        C2 = Q1 + u * s
+
+        dist = distance(C1, C2)
+        intersect = dist < eps
+
+        return C1, C2, dist, intersect
+
     # ----------------------------------------------------------------------
     def pan(self, event):
         if self._mouseAction != ACTION_PAN:
             self.config(cursor=mouseCursor(ACTION_PAN))
             self._mouseAction = ACTION_PAN
             
-        self.pan_delta(event.x - self._mouseX, event.y - self._mouseY)
+        self.pan_delta(event.x - self._x, event.y - self._y)
         
-        self._mouseX = event.x
-        self._mouseY = event.y
+        self._x = event.x
+        self._y = event.y
 
     def pan_delta(self, deltaX, deltaY):
         # Pan a number of pixels in X and/or Y
@@ -1358,7 +1416,37 @@ class CNCCanvas(GLCanvas):
         
         self.queueDraw()
     # ----------------------------------------------------------------------
-    def panRelease(self, event):
+    def midRelease(self, event):
+        # If there was no pan (just mid-click), and the user clicked on a path, 
+        # change the rotation center to the closest point of that line to the point where the user clicked
+        if self._mouseAction != ACTION_PAN:
+            lineIndex = self.find_closest(self._x, self._y, self.pathLines, CLOSE_DISTANCE, True)
+            
+            if lineIndex is not None:
+                line = self.pathLines.reshape((-1, 16))[int(lineIndex)]
+                lineStart = vec3(line[1:4])
+                lineEnd = vec3(line[9:12])
+
+                MVPinv = inverse(self.PMatrix * self.MVMatrix)
+
+                pickPoint = self.canvas2Unit(vec2(event.x, event.y))
+
+                # pickLine is a line perpendicular to the screen
+                pickLineStart =  vec3(MVPinv * vec4(pickPoint.x, pickPoint.y, 0, 1))
+                pickLineEnd = vec3(MVPinv * vec4(pickPoint.x, pickPoint.y, -1, 1))
+
+                # If pickLine does not exactly intersect line, we get 2 points:
+                # C1: closest point at pickLine
+                # C2: closest point at line
+                C1, C2, dist, intersect = self.closest_points_between_lines(pickLineStart, pickLineEnd, lineStart, lineEnd)
+
+                # Translate the MV Matrix, so that the clicked point moves to the screen center
+                RS = mat3x3(self.MVMatrix)
+                new_translation = -RS * C2
+                self.MVMatrix[3] = vec4(new_translation, 1)
+
+                self.queueDraw()
+
         self._mouseAction = None
         self.config(cursor=mouseCursor(self.action))
 
