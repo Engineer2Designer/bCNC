@@ -63,7 +63,7 @@ from CNC import CNC
 
 # Probe mapping we need PIL and numpy
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageTk, ImageFont, ImageDraw
     import numpy
 
     # Resampling image based on PIL library and converting to RGB.
@@ -190,8 +190,7 @@ openglFolder = f"{os.path.abspath(os.path.dirname(__file__))}{os.sep}opengl{os.s
 # -----------------------------------------------------------------------------
 def mouseCursor(action):
     return MOUSE_CURSOR.get(action, DEF_CURSOR)
-
-
+    
 # =============================================================================
 # Raise an alarm exception
 # =============================================================================
@@ -203,6 +202,9 @@ class AlarmException(Exception):
 # Drawing canvas
 # =============================================================================
 class CNCCanvas(GLCanvas):
+    def rgb8(self, colorName):
+        return (numpy.array(self.winfo_rgb(colorName)) * 255. / 65535.).astype(int)
+
     def __init__(self, master, app, *kw, **kwargs):
         super().__init__(master) # TODO: Handle takefocus and background parameters
 
@@ -330,9 +332,19 @@ class CNCCanvas(GLCanvas):
         self.pathLines = numpy.array([], dtype=numpy.float32)
         self._modelCenter = vec3(0, 0, 0)
         self._modelSize = 100.0
+        # Text items
+        self._text_id = 1
+        self.text = {} # text_id[location, text value, color]
         # Background gradiend colors
         self.bgColorUp = vec3(0.175, 0.215, 0.392)
         self.bgColorDn = vec3(0.4, 0.4, 0.6)
+        # Data of Texture atlas for text rendering
+        self.charOffsetAndWidth = []
+        self.create_char_texture("./bCNC/opengl/DejaVuSans.ttf", 12)
+        self.create_text(vec3(100, 0, 0), "X", self.rgb8("White"))
+        self.create_text(vec3(0, 100, 0), "Y", self.rgb8("White"))
+        self.create_text(vec3(0, 0, 100), "Z", self.rgb8("White"))
+
         # Axes
         self.axesVertices = numpy.array([], dtype=numpy.float32)
         # Gantry
@@ -351,7 +363,60 @@ class CNCCanvas(GLCanvas):
         self.createAxes()
 
         self.initPosition()
+    
+    def create_char_texture(self, font_name, font_size):
+        font = ImageFont.truetype(font_name, font_size)
+
+        # Get font metrics (ascent = top above baseline, descent = below baseline)
+        ascent, descent = font.getmetrics()
+
+        # Full safe height for drawing
+        self.textHeight = ascent + descent
+
+        # Get the width and offset of each char
+        offset = 0
+        for ch in range(128):
+            width = font.getlength(chr(ch))
+            self.charOffsetAndWidth.append([offset, width])
+            offset += width
         
+        image = Image.new("RGBA", (int(offset), int(self.textHeight)), (0, 0, 0, 0)) # type: ignore
+        
+        # Create a drawing object
+        draw = ImageDraw.Draw(image)
+
+        # Create an image with all the ascii chars
+        for ch in range(128):
+            draw.text((self.charOffsetAndWidth[ch][0], 0), chr(ch), fill="white", font=font)
+        
+        image = image.transpose(Image.FLIP_TOP_BOTTOM)  # OpenGL expects the y-axis to be flipped
+
+        self.charTextureAtlas = numpy.array(image)
+
+        # Generate a texture ID
+        self.textTexture = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, self.textTexture)
+
+        # Set the texture parameters
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+
+        # Upload texture data to OpenGL
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, len(self.charTextureAtlas[0]), len(self.charTextureAtlas), 0, GL_RGBA, GL_UNSIGNED_BYTE, self.charTextureAtlas)
+
+        # Generate Mipmap
+        glGenerateMipmap(GL_TEXTURE_2D)
+    
+    def create_text(self, location, text, color):
+        # Color is a tuple or numpy array of three 8bit integers
+        self.text[self._text_id] = [location, text, color]
+
+        id = self._text_id
+        self._text_id += 1
+
+        return id
 
     def initGL(self):
         # ----- BACKGROUND PROGRAM ------
@@ -472,6 +537,21 @@ class CNCCanvas(GLCanvas):
         # Create a Vertex Buffer Object (VBO)
         self.SelectionRectVBO = glGenBuffers(1)
 
+        # ----- TEXT PROGRAM ------
+        # Program to draw text
+        # Vertex Shader code
+        with open(openglFolder + "TextVS.shd", "r") as file:
+            TextVSCode = file.read()
+
+        # Fragment Shader code
+        with open(openglFolder + "TextFS.shd", "r") as file:
+            TextFSCode = file.read()
+
+        self.TextProgram = self.createProgram(TextVSCode, TextFSCode)
+        
+        # Create a Vertex Buffer Object (VBO)
+        self.TextVBO = glGenBuffers(1)
+        self.update_text_buffer(self.TextVBO, self.text)
 
         
         glClearColor(1.0, 1.0, 1.0, 1.0)
@@ -575,6 +655,97 @@ class CNCCanvas(GLCanvas):
 
         glBindBuffer(GL_ARRAY_BUFFER, 0)  # Unbind the VBO
     
+    def update_text_buffer(self, buffer, textDict: dict):
+        char_data = []
+        
+        for id in textDict.keys():
+            hOffset = 0
+
+            location = textDict[id][0]
+            text = textDict[id][1]
+            color = textDict[id][2]
+            colorValue = (color[0] << 16) + (color[1] << 8) + color[2] # RGB
+
+            for ch in range(len(text)):
+                # We define a quad as 2 triangles (6 vertices)
+                char_data.extend([
+                # Bottom left
+                    id, # Text id
+                    1, # Vertex index
+                    location[0], # Location of the bottom left corner
+                    location[1],
+                    location[2],
+                    hOffset,
+                    self.charOffsetAndWidth[ord(text[ch])][0], # Char offset in texture atlas in pixels
+                    self.charOffsetAndWidth[ord(text[ch])][1], # Char width in texture atlas in pixels
+                    self.textHeight, #Char height in texture atlas
+                    colorValue,
+                # Bottom left
+                    id, # Text id
+                    2, # Vertex index
+                    location[0], # Location of the bottom left corner
+                    location[1],
+                    location[2],
+                    hOffset,
+                    self.charOffsetAndWidth[ord(text[ch])][0], # Char offset in texture atlas in pixels
+                    self.charOffsetAndWidth[ord(text[ch])][1], # Char width in texture atlas in pixels
+                    self.textHeight, #Char height in texture atlas
+                    colorValue,
+                # Bottom left
+                    id, # Text id
+                    3, # Vertex index
+                    location[0], # Location of the bottom left corner
+                    location[1],
+                    location[2],
+                    hOffset,
+                    self.charOffsetAndWidth[ord(text[ch])][0], # Char offset in texture atlas in pixels
+                    self.charOffsetAndWidth[ord(text[ch])][1], # Char width in texture atlas in pixels
+                    self.textHeight, #Char height in texture atlas
+                    colorValue,
+                # Bottom left
+                    id, # Text id
+                    1, # Vertex index
+                    location[0], # Location of the bottom left corner
+                    location[1],
+                    location[2],
+                    hOffset,
+                    self.charOffsetAndWidth[ord(text[ch])][0], # Char offset in texture atlas in pixels
+                    self.charOffsetAndWidth[ord(text[ch])][1], # Char width in texture atlas in pixels
+                    self.textHeight, #Char height in texture atlas
+                    colorValue,
+                # Bottom left
+                    id, # Text id
+                    3, # Vertex index
+                    location[0], # Location of the bottom left corner
+                    location[1],
+                    location[2],
+                    hOffset,
+                    self.charOffsetAndWidth[ord(text[ch])][0], # Char offset in texture atlas in pixels
+                    self.charOffsetAndWidth[ord(text[ch])][1], # Char width in texture atlas in pixels
+                    self.textHeight, #Char height in texture atlas
+                    colorValue,
+                # Bottom left
+                    id, # Text id
+                    4, # Vertex index
+                    location[0], # Location of the bottom left corner
+                    location[1],
+                    location[2],
+                    hOffset,
+                    self.charOffsetAndWidth[ord(text[ch])][0], # Char offset in texture atlas in pixels
+                    self.charOffsetAndWidth[ord(text[ch])][1], # Char width in texture atlas in pixels
+                    self.textHeight, #Char height in texture atlas
+                    colorValue,
+                ])
+
+                hOffset += self.charOffsetAndWidth[ord(text[ch])][1]
+            
+        self.textVertices = numpy.array(char_data, dtype=numpy.float32)
+        
+        glBindBuffer(GL_ARRAY_BUFFER, buffer)
+        glBufferData(GL_ARRAY_BUFFER, self.textVertices.nbytes, self.textVertices, GL_DYNAMIC_DRAW)
+
+        glBindBuffer(GL_ARRAY_BUFFER, 0)  # Unbind the VBO
+
     # Calculate arguments for antialiasing
     def antialias_args(self, args, winc=0.5, cw=2):
         nargs = {}
@@ -2062,6 +2233,8 @@ class CNCCanvas(GLCanvas):
         glEnableVertexAttribArray(glGetAttribLocation(self.backgroundProgram, "color"))
         glDrawArrays(GL_TRIANGLES, 0, 6)
 
+        glClear(GL_DEPTH_BUFFER_BIT)
+
         # Draw grid
         if self.draw_grid:
             glUseProgram(self.gridProgram)
@@ -2121,6 +2294,49 @@ class CNCCanvas(GLCanvas):
             glDrawArrays(GL_LINES, 0, len(self.pathLines) // PARAMETERS_PER_VERTEX)
             glBindBuffer(GL_ARRAY_BUFFER, 0)
         
+        # Draw Text
+        if self.textVertices.size > 0:
+            glDisable(GL_DEPTH_TEST)
+            glDisable(GL_CULL_FACE)
+            glUseProgram(self.TextProgram)
+            glBindBuffer(GL_ARRAY_BUFFER, self.TextVBO)
+            PARAMETERS_PER_VERTEX = 10
+            #glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "id"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+            glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "index"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(1*4))
+            glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "location"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(2*4))
+            glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "hOffset"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(5*4))
+            glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "charoffset"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(6*4))
+            glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "charwidth"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(7*4))
+            glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "charheight"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(8*4))
+            glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "colorValue"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(9*4))
+            #glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "id"))
+            glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "index"))
+            glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "location"))
+            glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "hOffset"))
+            glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "charoffset"))
+            glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "charwidth"))
+            glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "charheight"))
+            glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "colorValue"))
+
+            MVP = self.PMatrix * self.MVMatrix
+            mv_loc = glGetUniformLocation(program=self.TextProgram, name="MVP")
+            glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+
+            textAtlasWidth_loc = glGetUniformLocation(program=self.TextProgram, name="textAtlasWidth")
+            glUniform1f(textAtlasWidth_loc, len(self.charTextureAtlas[0]))
+
+            canvasWidth_loc = glGetUniformLocation(program=self.TextProgram, name="canvasWidth")
+            glUniform1f(canvasWidth_loc, self.winfo_width())
+            canvasHeight_loc = glGetUniformLocation(program=self.TextProgram, name="canvasHeight")
+            glUniform1f(canvasHeight_loc, self.winfo_height())
+
+            # Set the uniform variable 'ourTexture' to texture unit 0
+            glActiveTexture(GL_TEXTURE0)
+            glBindTexture(GL_TEXTURE_2D, self.textTexture)
+            glUniform1i(glGetUniformLocation(self.TextProgram, "ourTexture"), 0)
+
+            glDrawArrays(GL_TRIANGLES, 0, int(len(self.textVertices) // PARAMETERS_PER_VERTEX))
+
         # Draw axes
         if self.draw_axes:
             glDisable(GL_DEPTH_TEST)

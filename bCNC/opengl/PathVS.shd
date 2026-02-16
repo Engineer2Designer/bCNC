@@ -41,7 +41,7 @@ void main() {
             float G = floor(mod(floor(colorValue / 256.0), 256.0));
             float B = mod(colorValue, 256.0);
 
-            color = vec3(R, G, B) / 256.;
+            color = vec3(R, G, B) / 255.;
         }
         else {
             color = vec3(0.3, 0.3, 0.3); // GRAY
