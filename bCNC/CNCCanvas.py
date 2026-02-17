@@ -851,7 +851,8 @@ class CNCCanvas(GLCanvas):
         self.action = action
         self.actionVar.set(action)
         self._mouseAction = None
-        self.config(cursor=mouseCursor(self.action), background="White")
+        # TODO: Is this necessary?
+        #self.config(cursor=mouseCursor(self.action), background="White")
 
     # ----------------------------------------------------------------------
     def actionCancel(self, event=None):
