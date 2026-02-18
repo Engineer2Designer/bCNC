@@ -13,6 +13,11 @@ if sys.platform == 'linux':
     # PyOpenGL is broken with wayland:
     OpenGL.setPlatform('x11')
 
+try:
+    import cv2 as cv
+except ImportError:
+    cv = None
+
 from OpenGL.GL import *
 from ctypes import c_void_p
 from pyglm.glm import mat4x4, mat3x3, ortho, identity, value_ptr, inverse, translate, rotate, vec2, vec3, vec4, inverse, normalize, lookAt, dot, distance
@@ -122,20 +127,11 @@ SELECT_COLOR = "Blue"
 SELECT2_COLOR = "DarkCyan"
 PROCESS_COLOR = "Green"
 
-BLUE = 255.
-DARK_CYAN = 35723.
-ORANGE = 16753920.
-DARK_ORANGE = 16747520.
-LIGHT_GRAY = 13882323.
-BLACK = 0.
-
 MOVE_COLOR = "DarkCyan"
 RULER_COLOR = "Green"
 PROBE_TEXT_COLOR = "Green"
 
 INFO_COLOR = "Gold"
-
-SELECTION_TAGS = ("sel", "sel2", "sel3", "sel4")
 
 ACTION_SELECT = 0
 ACTION_SELECT_SINGLE = 1
@@ -258,23 +254,13 @@ class CNCCanvas(GLCanvas):
         self.zoom = 1.
         self.__tzoom = 1.0  # delayed zoom (temporary)
         self._items = {}
-        self._viewCenterX = 0
-        self._viewCenterY = 0
-
         self._x = self._y = 0
         self._xp = self._yp = 0
         self.action = ACTION_SELECT
         self._mouseAction = None
-        self._inDraw = False  # semaphore for parsing
-        self._gantry1 = None
-        self._gantry2 = None
-        self._margin = None
-        self._amargin = None
-        self._workarea = None
         self._vector = None
         self._lastActive = None
         self._lastGantry = None
-        self._gantryRadius = None
         self._gantryLocation = vec3(0, 0, 0)
         self._drawRequested = False
 
@@ -294,14 +280,9 @@ class CNCCanvas(GLCanvas):
         self.cameraDy = 0
         self.cameraZ = None  # if None it will not make any Z movement for the camera
         self.cameraSwitch = False  # Look at spindle(False) or camera(True)
+        self.cameraLocation = vec2(0., 0.)
         self._cameraAfter = None  # Camera anchor location "" for gantry
-        self._cameraMaxWidth = 640  # on zoom over this size crop the image
-        self._cameraMaxHeight = 480
-        self._cameraImage = None
-        self._cameraHori = None  # cross hair items
-        self._cameraVert = None
-        self._cameraCircle = None
-        self._cameraCircle2 = None
+        self._showCamera = False
 
         self.draw_axes = True  # Drawing flags
         self.draw_grid = True
@@ -338,17 +319,11 @@ class CNCCanvas(GLCanvas):
         # Background gradiend colors
         self.bgColorUp = vec3(0.175, 0.215, 0.392)
         self.bgColorDn = vec3(0.4, 0.4, 0.6)
-        # Data of Texture atlas for text rendering
-        self.charOffsetAndWidth = []
-        self.create_char_texture("./bCNC/opengl/DejaVuSans.ttf", 12)
-        self.create_text(vec3(100, 0, 0), "X", self.rgb8("White"))
-        self.create_text(vec3(0, 100, 0), "Y", self.rgb8("White"))
-        self.create_text(vec3(0, 0, 100), "Z", self.rgb8("White"))
 
         # Axes
-        self.axesVertices = numpy.array([], dtype=numpy.float32)
+        self.numAxesVertices = 0
         # Gantry
-        self.gantryVertices = numpy.array([], dtype=numpy.float32)
+        self.numGantryVertices = 0
         # Grid
         self.gridVertices = numpy.array([], dtype=numpy.float32)
         # Margins
@@ -357,13 +332,33 @@ class CNCCanvas(GLCanvas):
         self.workAreaVertices = numpy.array([], dtype=numpy.float32)
         # Selection Rectangle
         self.SelectionRectVertices = numpy.array([], dtype=numpy.float32)
+        # Camera vertices
+        self.CameraRectVertices = numpy.array([1., 2., 3., 1., 3., 4.], dtype=numpy.float32)
+        self.CrossHairVertices = numpy.arange(1, 293, dtype=numpy.float32)
         
         self.reset()
         self.initGL()
         self.createAxes()
+        self.createGantry()
+
+        # Data of Texture atlas for text rendering
+        self.charOffsetAndWidth = []
+        self.create_char_texture("./bCNC/opengl/DejaVuSans.ttf", 12)
+        self.create_text(vec3(100, 0, 0), "X", self.rgb8("White"))
+        self.create_text(vec3(0, 100, 0), "Y", self.rgb8("White"))
+        self.create_text(vec3(0, 0, 100), "Z", self.rgb8("White"))
+        self.update_text_buffer(self.TextVBO, self.text)
 
         self.initPosition()
     
+    def get_camera_image(self):
+        if (self.camera.image is None) or (cv is None):
+            return None
+        
+        tex = cv.flip(cv.cvtColor(self.camera.image, cv.COLOR_BGR2RGBA), 0)
+    
+        return tex
+
     def create_char_texture(self, font_name, font_size):
         font = ImageFont.truetype(font_name, font_size)
 
@@ -393,8 +388,6 @@ class CNCCanvas(GLCanvas):
 
         self.charTextureAtlas = numpy.array(image)
 
-        # Generate a texture ID
-        self.textTexture = glGenTextures(1)
         glBindTexture(GL_TEXTURE_2D, self.textTexture)
 
         # Set the texture parameters
@@ -551,9 +544,50 @@ class CNCCanvas(GLCanvas):
         
         # Create a Vertex Buffer Object (VBO)
         self.TextVBO = glGenBuffers(1)
-        self.update_text_buffer(self.TextVBO, self.text)
 
+        # ----- IMAGE PROGRAM ------
+        # Program to draw images
+        # Vertex Shader code
+        with open(openglFolder + "ImageVS.shd", "r") as file:
+            ImageVSCode = file.read()
+
+        # Fragment Shader code
+        with open(openglFolder + "ImageFS.shd", "r") as file:
+            ImageFSCode = file.read()
+
+        self.ImageProgram = self.createProgram(ImageVSCode, ImageFSCode)
         
+        # Create a Vertex Buffer Object (VBO)
+        self.CameraVBO = glGenBuffers(1)
+
+        # Create textures
+        self.textTexture = glGenTextures(1)
+        self.cameraTexture = glGenTextures(1)
+
+        # Fill the buffer of the camera rectangle, which is fixed
+        glBindBuffer(GL_ARRAY_BUFFER, self.CameraVBO)
+        glBufferData(GL_ARRAY_BUFFER, self.CameraRectVertices.nbytes, self.CameraRectVertices, GL_STATIC_DRAW)
+        
+        # ----- CROSSHAIR PROGRAM ------
+        # Program to draw the Camera Crosshair
+        # Vertex Shader code
+        with open(openglFolder + "CrossHairVS.shd", "r") as file:
+            CrossHairVSCode = file.read()
+
+        # Fragment Shader code
+        with open(openglFolder + "CrossHairFS.shd", "r") as file:
+            CrossHairFSCode = file.read()
+
+        self.CrossHairProgram = self.createProgram(CrossHairVSCode, CrossHairFSCode)
+        
+        # Create a Vertex Buffer Object (VBO)
+        self.CrossHairVBO = glGenBuffers(1)
+
+        # Fill the buffer of the crosshair, which is fixed
+        glBindBuffer(GL_ARRAY_BUFFER, self.CrossHairVBO)
+        glBufferData(GL_ARRAY_BUFFER, self.CrossHairVertices.nbytes, self.CrossHairVertices, GL_STATIC_DRAW)
+
+
         glClearColor(1.0, 1.0, 1.0, 1.0)
         
     def createProgram(self, vertexShaderCode, fragmentShaderCode):
@@ -1635,7 +1669,7 @@ class CNCCanvas(GLCanvas):
     def panDown(self, event=None):
         self.pan_delta(0, -15)
 
-    def canvas2Unit(self, coords : vec2):
+    def canvas2Unit(self, coords : vec2) -> vec2:
         # Map screen pixel coordinates to opengl screen coords [-1.0 -> 1.0]
         # In OpenGL, y goes positive upwards
         width = self.winfo_width()
@@ -1646,6 +1680,23 @@ class CNCCanvas(GLCanvas):
             1 - coords.y / (height / 2.0)
         )
     
+    def unit2Canvas(self, coords : vec2) -> vec2:
+        # Map opengl screen coords [-1.0 -> 1.0] to screen pixel coordinates
+        # In OpenGL, y goes positive upwards
+        width = self.winfo_width()
+        height = self.winfo_height()
+        
+        return vec2(
+            (coords.x + 1.) * (width / 2.),
+            (1 - coords.y) * (height / 2.)
+        )
+    
+    def world2Canvas(self, coords : vec3) -> vec2:
+        MVP = self.PMatrix * self.MVMatrix
+        unitCoords = (MVP * vec4(coords, 1)).xy
+
+        return self.unit2Canvas(unitCoords)
+
     def canvas2World(self, coords : vec2) -> vec3:
         coordsUnit = self.canvas2Unit(coords)
         
@@ -1700,6 +1751,8 @@ class CNCCanvas(GLCanvas):
                              -10000,
                              10000)
         
+        self.cameraPosition()
+
         self.queueDraw()
         
         # TODO: Implement the rest
@@ -1790,46 +1843,6 @@ class CNCCanvas(GLCanvas):
         self.cameraPosition()
         self.queueDraw()
 
-    def fit2Screen_old(self, event=None):
-        bb = self.selBbox()
-        if bb is None:
-            return
-        x1, y1, x2, y2 = bb
-
-        try:
-            zx = float(self.winfo_width()) / (x2 - x1)
-        except Exception:
-            return
-        try:
-            zy = float(self.winfo_height()) / (y2 - y1)
-        except Exception:
-            return
-        if zx > 1.0:
-            self.__tzoom = min(zx, zy)
-        else:
-            self.__tzoom = max(zx, zy)
-
-        self._tx = self._ty = 0
-        self._zoomCanvas()
-
-        # Find position of new selection
-        x1, y1, x2, y2 = self.selBbox()
-        xm = (x1 + x2) // 2
-        ym = (y1 + y2) // 2
-        sx1, sy1, sx2, sy2 = map(float, self.cget("scrollregion").split())
-        midx = float(xm - sx1) / (sx2 - sx1)
-        midy = float(ym - sy1) / (sy2 - sy1)
-
-        a, b = self.xview()
-        d = (b - a) / 2.0
-        self.xview_moveto(midx - d)
-
-        a, b = self.yview()
-        d = (b - a) / 2.0
-        self.yview_moveto(midy - d)
-
-        self.cameraPosition()
-
     # ----------------------------------------------------------------------
     def menuZoomIn(self, event=None):
         x = self.winfo_width() // 2
@@ -1878,7 +1891,7 @@ class CNCCanvas(GLCanvas):
     def gantry(self, wx, wy, wz, mx, my, mz):
         self._lastGantry = (wx, wy, wz)
         self.updateGantry(wx, wy, wz)
-        if self._cameraImage and self.cameraAnchor == NONE:
+        if self._showCamera and self.cameraAnchor == NONE:
             self.cameraPosition()
 
         dx = wx - mx
@@ -1907,9 +1920,9 @@ class CNCCanvas(GLCanvas):
             self._lastActive = None
         
         self.deselectAll(self.pathLines, self.pathVBO)
-        """ for i in SELECTION_TAGS:
-            self.dtag(i)
-        self.delete("info") """
+        """ 
+        self.delete("info")
+        """
 
     # ----------------------------------------------------------------------
     # Highlight selected items
@@ -2073,14 +2086,8 @@ class CNCCanvas(GLCanvas):
 
     # -----------------------------------------------------------------------
     def cameraOff(self, event=None):
-        return # TODO: implement this function
-        self.delete(self._cameraImage)
-        self.delete(self._cameraHori)
-        self.delete(self._cameraVert)
-        self.delete(self._cameraCircle)
-        self.delete(self._cameraCircle2)
+        self._showCamera = False
 
-        self._cameraImage = None
         if self._cameraAfter:
             self.after_cancel(self._cameraAfter)
             self._cameraAfter = None
@@ -2106,33 +2113,30 @@ class CNCCanvas(GLCanvas):
         self.camera.ycenter = self.cameraYCenter
         if self.cameraEdge:
             self.camera.canny(50, 200)
-        if self.cameraAnchor == NONE or self.zoom / self.cameraScale > 1.0:
-            self.camera.resize(
-                self.zoom / self.cameraScale,
-                self._cameraMaxWidth,
-                self._cameraMaxHeight,
-            )
-        if self._cameraImage is None:
-            self._cameraImage = self.create_image((0, 0), tag="CameraImage")
-            self.lower(self._cameraImage)
-            # create cross hair at dummy location we will correct latter
-            self._cameraHori = self.create_line(
-                0, 0, 1, 0, fill=CAMERA_COLOR, tag="CrossHair"
-            )
-            self._cameraVert = self.create_line(
-                0, 0, 0, 1, fill=CAMERA_COLOR, tag="CrossHair"
-            )
-            self._cameraCircle = self.create_oval(
-                0, 0, 1, 1, outline=CAMERA_COLOR, tag="CrossHair"
-            )
-            self._cameraCircle2 = self.create_oval(
-                0, 0, 1, 1, outline=CAMERA_COLOR, dash=(3, 3), tag="CrossHair"
-            )
-            self.cameraPosition()
+
+        if not self._showCamera:
+            self._showCamera = True
+        
+        self.cameraPosition()
+
         try:
-            self.itemconfig(self._cameraImage, image=self.camera.toTk())
+            self.cameraImage = self.get_camera_image()
+            glActiveTexture(GL_TEXTURE0)
+            glBindTexture(GL_TEXTURE_2D, self.cameraTexture)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+                         len(self.cameraImage[0]),
+                         len(self.cameraImage),
+                         0, GL_RGBA, GL_UNSIGNED_BYTE, self.cameraImage)
+            
+            self.queueDraw()
+
         except Exception:
             pass
+
         self._cameraAfter = self.after(100, self.cameraRefresh)
 
     # -----------------------------------------------------------------------
@@ -2152,27 +2156,27 @@ class CNCCanvas(GLCanvas):
     # Reposition camera and crosshair
     # ----------------------------------------------------------------------
     def cameraPosition(self):
-        # TODO: Implement this function
-        return
-    
-        if self._cameraImage is None:
+        if not self._showCamera:
             return
+        
         w = self.winfo_width()
         h = self.winfo_height()
         hc, wc = self.camera.image.shape[:2]
-        wc //= 2
-        hc //= 2
-        x = w // 2  # everything on center
-        y = h // 2
-        if self.cameraAnchor is NONE:
-            if self._lastGantry is not None:
-                x, y = self.plotCoords([self._lastGantry])[0]
-            else:
-                x = y = 0
+        zoomx = self.PMatrix[0][0]
+        zoomy = self.PMatrix[1][1]
+        wc *= 0.5 / self.cameraScale * zoomx * w / 2.
+        hc *= 0.5 / self.cameraScale * zoomy * h / 2.
+        x = w / 2  # everything on center
+        y = h / 2
+
+        if self.cameraAnchor == NONE: # Center on Gantry
+            dx = dy = 0
             if not self.cameraSwitch:
-                x += self.cameraDx * self.zoom
-                y -= self.cameraDy * self.zoom
-            r = self.cameraR * self.zoom
+                dx = self.cameraDx
+                dy = self.cameraDy
+
+            x, y = self.world2Canvas(vec3(self._gantryLocation) + vec3(dx, dy, 0))
+            
         else:
             if self.cameraAnchor != CENTER:
                 if N in self.cameraAnchor:
@@ -2183,19 +2187,8 @@ class CNCCanvas(GLCanvas):
                     x = wc
                 elif E in self.cameraAnchor:
                     x = w - wc
-            x = self.canvasx(x)
-            y = self.canvasy(y)
-            if self.zoom / self.cameraScale > 1.0:
-                r = self.cameraR * self.zoom
-            else:
-                r = self.cameraR * self.cameraScale
-
-        self.coords(self._cameraImage, x, y)
-        self.coords(self._cameraHori, x - wc, y, x + wc, y)
-        self.coords(self._cameraVert, x, y - hc, x, y + hc)
-        self.coords(self._cameraCircle, x - r, y - r, x + r, y + r)
-        self.coords(
-            self._cameraCircle2, x - r * 2, y - r * 2, x + r * 2, y + r * 2)
+        
+        self.cameraLocation = vec2(x, y)
 
     # ----------------------------------------------------------------------
     # Crop center of camera and search it in subsequent movements
@@ -2234,7 +2227,100 @@ class CNCCanvas(GLCanvas):
         glEnableVertexAttribArray(glGetAttribLocation(self.backgroundProgram, "color"))
         glDrawArrays(GL_TRIANGLES, 0, 6)
 
+        # Ensure that the next items are drawn on top of this
         glClear(GL_DEPTH_BUFFER_BIT)
+
+        # Draw Camera
+        if self._showCamera:
+            glDisable(GL_CULL_FACE)
+            glUseProgram(self.ImageProgram)
+            glBindBuffer(GL_ARRAY_BUFFER, self.CameraVBO)
+            PARAMETERS_PER_VERTEX = 1
+            glVertexAttribPointer(glGetAttribLocation(self.ImageProgram, "index"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+            glEnableVertexAttribArray(glGetAttribLocation(self.ImageProgram, "index"))
+
+            MVP = self.PMatrix * self.MVMatrix
+            mv_loc = glGetUniformLocation(program=self.ImageProgram, name="MVP")
+            glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+
+            location_loc = glGetUniformLocation(program=self.ImageProgram, name="location")
+            glUniform2fv(location_loc, 1, value_ptr(self.cameraLocation))
+
+            # Set the uniform variable 'ourTexture' to texture unit 0
+            glActiveTexture(GL_TEXTURE0)
+            glBindTexture(GL_TEXTURE_2D, self.cameraTexture)
+            glUniform1i(glGetUniformLocation(self.ImageProgram, "ourTexture"), 0)
+
+            width_loc = glGetUniformLocation(program=self.ImageProgram, name="width")
+            glUniform1f(width_loc, len(self.cameraImage[0]))
+
+            height_loc = glGetUniformLocation(program=self.ImageProgram, name="height")
+            glUniform1f(height_loc, len(self.cameraImage))
+
+            canvasWidth_loc = glGetUniformLocation(program=self.ImageProgram, name="canvasWidth")
+            glUniform1f(canvasWidth_loc, self.winfo_width())
+
+            canvasHeight_loc = glGetUniformLocation(program=self.ImageProgram, name="canvasHeight")
+            glUniform1f(canvasHeight_loc, self.winfo_height())
+
+            # We get the zoom from the projection matrix
+            zoomx = self.PMatrix[0][0]
+            zoomy = self.PMatrix[1][1]
+            zoom_loc = glGetUniformLocation(program=self.ImageProgram, name="zoom")
+            glUniform2f(zoom_loc, zoomx, zoomy)
+            
+            cameraScale_loc = glGetUniformLocation(program=self.ImageProgram, name="cameraScale")
+            glUniform1f(cameraScale_loc, self.cameraScale)
+
+            glDrawArrays(GL_TRIANGLES, 0, 6)
+
+            # Ensure that the next items are drawn on top of this
+            glClear(GL_DEPTH_BUFFER_BIT)
+        
+        # Draw Crosshair
+        if self._showCamera:
+            glUseProgram(self.CrossHairProgram)
+            glBindBuffer(GL_ARRAY_BUFFER, self.CrossHairVBO)
+            PARAMETERS_PER_VERTEX = 1
+            glVertexAttribPointer(glGetAttribLocation(self.CrossHairProgram, "index"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+            glEnableVertexAttribArray(glGetAttribLocation(self.CrossHairProgram, "index"))
+
+            MVP = self.PMatrix * self.MVMatrix
+            mv_loc = glGetUniformLocation(program=self.CrossHairProgram, name="MVP")
+            glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+
+            location_loc = glGetUniformLocation(program=self.CrossHairProgram, name="location")
+            glUniform2fv(location_loc, 1, value_ptr(self.cameraLocation))
+
+            width_loc = glGetUniformLocation(program=self.CrossHairProgram, name="width")
+            glUniform1f(width_loc, len(self.cameraImage[0]))
+
+            height_loc = glGetUniformLocation(program=self.CrossHairProgram, name="height")
+            glUniform1f(height_loc, len(self.cameraImage))
+
+            canvasWidth_loc = glGetUniformLocation(program=self.CrossHairProgram, name="canvasWidth")
+            glUniform1f(canvasWidth_loc, self.winfo_width())
+
+            canvasHeight_loc = glGetUniformLocation(program=self.CrossHairProgram, name="canvasHeight")
+            glUniform1f(canvasHeight_loc, self.winfo_height())
+
+            R_loc = glGetUniformLocation(program=self.CrossHairProgram, name="R")
+            glUniform1f(R_loc, self.cameraR)
+
+            # We get the zoom from the projection matrix
+            zoomx = self.PMatrix[0][0]
+            zoomy = self.PMatrix[1][1]
+            zoom_loc = glGetUniformLocation(program=self.CrossHairProgram, name="zoom")
+            glUniform2f(zoom_loc, zoomx, zoomy)
+
+            cameraScale_loc = glGetUniformLocation(program=self.ImageProgram, name="cameraScale")
+            glUniform1f(cameraScale_loc, self.cameraScale)
+
+            glLineWidth(1)
+            glDrawArrays(GL_LINES, 0, len(self.CrossHairVertices) // PARAMETERS_PER_VERTEX)
+
+            # Ensure that the next items are drawn on top of this
+            glClear(GL_DEPTH_BUFFER_BIT)
 
         # Draw grid
         if self.draw_grid:
@@ -2361,11 +2447,12 @@ class CNCCanvas(GLCanvas):
             glLineWidth(2)
             glEnable(GL_LINE_SMOOTH)
             glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
-            glDrawArrays(GL_LINES, 0, len(self.axesVertices) // PARAMETERS_PER_VERTEX)
+            glDrawArrays(GL_LINES, 0, self.numAxesVertices // PARAMETERS_PER_VERTEX)
             glBindBuffer(GL_ARRAY_BUFFER, 0)
         
         # Draw gantry
         glUseProgram(self.gantryProgram)
+        glEnable(GL_CULL_FACE)
         glBindBuffer(GL_ARRAY_BUFFER, self.gantryVBO)
         PARAMETERS_PER_VERTEX = 6
         glVertexAttribPointer(glGetAttribLocation(self.gantryProgram, "xyz"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
@@ -2387,11 +2474,15 @@ class CNCCanvas(GLCanvas):
         glUniform3fv(light1dir_loc, 1, value_ptr(light1dir))
         light2dir_loc = glGetUniformLocation(program=self.gantryProgram, name="light2dir")
         glUniform3fv(light2dir_loc, 1, value_ptr(light2dir))
+
+        diameter = max(6., CNC.vars["diameter"])
+        diameter_loc = glGetUniformLocation(program=self.gantryProgram, name="diameter")
+        glUniform1f(diameter_loc, diameter)
         
         glLineWidth(2)
         glEnable(GL_LINE_SMOOTH)
         glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
-        glDrawArrays(GL_TRIANGLES, 0, len(self.gantryVertices) // PARAMETERS_PER_VERTEX)
+        glDrawArrays(GL_TRIANGLES, 0, self.numGantryVertices // PARAMETERS_PER_VERTEX)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         
         # Draw selection rectangle
@@ -2502,9 +2593,6 @@ class CNCCanvas(GLCanvas):
         # TODO: Anything apart from paths must be deleted...?
         #self.delete(ALL)
         self.deletePaths()
-        
-        self._cameraImage = None
-        
         self.updateGantry(0, 0, 0)
 
         self._lastInsert = None
@@ -2519,60 +2607,59 @@ class CNCCanvas(GLCanvas):
     # ----------------------------------------------------------------------
     def updateGantry(self, x, y, z):
         self._gantryLocation = vec3(x, y, z)
-        
-        gr = max(3, int(CNC.vars["diameter"] / 2.0))
-        
-        if self._gantryRadius == None or self._gantryRadius != gr:
-            self._gantryRadius = gr
-            gh = 3 * gr
-            
-            NUM_FACES = 32 # Number of faces in the whole turn of 360º
-            
-            # We create the gantry as a conical closed surface made up of triangles
-            faceAngle = 2 * math.pi / NUM_FACES
-            coneAngle = math.atan(gr / gh)
-            
-            vertices = []
-            
-            # We also calculate the normal vector for each vertex, in order to shade lights
-            
-            for f in range(NUM_FACES):
-                # Lower Cone
-                vertices.extend([
-                    gr * math.cos(faceAngle * f),
-                    gr * math.sin(faceAngle * f),
-                    gh,
-                    math.cos(coneAngle) * math.cos(faceAngle * f), math.cos(coneAngle) * math.sin(faceAngle * f), -math.sin(coneAngle)])
-                vertices.extend([
-                    0, 0, 0,
-                    math.cos(coneAngle) * math.cos(faceAngle * f), math.cos(coneAngle) * math.sin(faceAngle * f), -math.sin(coneAngle)]) # normal
-                vertices.extend([
-                    gr * math.cos(faceAngle * (f+1)),
-                    gr * math.sin(faceAngle * (f+1)),
-                    gh,
-                    math.cos(coneAngle) * math.cos(faceAngle * (f+1)), math.cos(coneAngle) * math.sin(faceAngle * (f+1)), -math.sin(coneAngle)])
-                # Upper Disc
-                vertices.extend([
-                    0, 0, gh, 
-                    0, 0, 1]) # Normal pointing upwards [0, 0, 1]
-                vertices.extend([
-                    gr * math.cos(faceAngle * f),
-                    gr * math.sin(faceAngle * f),
-                    gh,
-                    0, 0, 1])
-                vertices.extend([
-                    gr * math.cos(faceAngle * (f+1)),
-                    gr * math.sin(faceAngle * (f+1)),
-                    gh,
-                    0, 0, 1])
-            
-            self.gantryVertices = numpy.array(vertices, dtype=numpy.float32)
-            
-            glBindBuffer(GL_ARRAY_BUFFER, self.gantryVBO)
-            glBufferData(GL_ARRAY_BUFFER, self.gantryVertices.nbytes, self.gantryVertices, GL_STATIC_DRAW)
-            glBindBuffer(GL_ARRAY_BUFFER, 0)
-        
         self.queueDraw()
+
+    def createGantry(self):
+        # Gantry geometry of diameter 1. We scale it with the actual diameter in the shader
+        gr = 0.5
+        gh = 3 * gr
+        
+        NUM_FACES = 32 # Number of faces in the whole turn of 360º
+        
+        # We create the gantry as a conical closed surface made up of triangles
+        faceAngle = 2 * math.pi / NUM_FACES
+        coneAngle = math.atan(gr / gh)
+        
+        vertices = []
+        
+        # We also calculate the normal vector for each vertex, in order to shade lights
+        
+        for f in range(NUM_FACES):
+            # Lower Cone
+            vertices.extend([
+                gr * math.cos(faceAngle * f),
+                gr * math.sin(faceAngle * f),
+                gh,
+                math.cos(coneAngle) * math.cos(faceAngle * f), math.cos(coneAngle) * math.sin(faceAngle * f), -math.sin(coneAngle)])
+            vertices.extend([
+                0, 0, 0,
+                math.cos(coneAngle) * math.cos(faceAngle * f), math.cos(coneAngle) * math.sin(faceAngle * f), -math.sin(coneAngle)]) # normal
+            vertices.extend([
+                gr * math.cos(faceAngle * (f+1)),
+                gr * math.sin(faceAngle * (f+1)),
+                gh,
+                math.cos(coneAngle) * math.cos(faceAngle * (f+1)), math.cos(coneAngle) * math.sin(faceAngle * (f+1)), -math.sin(coneAngle)])
+            # Upper Disc
+            vertices.extend([
+                0, 0, gh, 
+                0, 0, 1]) # Normal pointing upwards [0, 0, 1]
+            vertices.extend([
+                gr * math.cos(faceAngle * f),
+                gr * math.sin(faceAngle * f),
+                gh,
+                0, 0, 1])
+            vertices.extend([
+                gr * math.cos(faceAngle * (f+1)),
+                gr * math.sin(faceAngle * (f+1)),
+                gh,
+                0, 0, 1])
+        
+        gantryVertices = numpy.array(vertices, dtype=numpy.float32)
+        self.numGantryVertices = gantryVertices.nbytes
+        
+        glBindBuffer(GL_ARRAY_BUFFER, self.gantryVBO)
+        glBufferData(GL_ARRAY_BUFFER, self.numGantryVertices, gantryVertices, GL_STATIC_DRAW)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
 
     # ----------------------------------------------------------------------
     # Create system axes
@@ -2589,7 +2676,7 @@ class CNCCanvas(GLCanvas):
             else:
                 s = 100.0
         
-        self.axesVertices = numpy.array([
+        axesVertices = numpy.array([
             # X axis
             0, 0, 0, # Start Point
             0, # position. 0 for the first point of the line and length for the second. Used for dashed lines
@@ -2602,9 +2689,11 @@ class CNCCanvas(GLCanvas):
             # Z axis          
             0, 0, 0, 0, 3, 0, 0, s, s, 3
         ], dtype=numpy.float32)
+
+        self.numAxesVertices = axesVertices.nbytes
         
         glBindBuffer(GL_ARRAY_BUFFER, self.axesVBO)
-        glBufferData(GL_ARRAY_BUFFER, self.axesVertices.nbytes, self.axesVertices, GL_STATIC_DRAW)
+        glBufferData(GL_ARRAY_BUFFER, self.numAxesVertices, axesVertices, GL_STATIC_DRAW)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
 
     # Update the selection rectangle
