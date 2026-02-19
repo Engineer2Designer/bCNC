@@ -14,6 +14,8 @@ uniform float R; // Radius of the inner circle
 uniform vec2 zoom;
 uniform float cameraScale;
 
+varying float alpha; // To create the outer circle dash effect
+
 void main() {
     // Change pixel units to unit units
     float u = location.x / canvasWidth * 2. - 1.;
@@ -27,6 +29,8 @@ void main() {
     // Vertical line: Index 289-290
     // Horizontal line: Index 291-292
 
+    alpha = 1.;
+
     // All this would have been much easier with newer glsl versions, using geometry shaders.
 
     // Inner circle
@@ -36,9 +40,11 @@ void main() {
 
     // Outer circle
     else if (index >= 145. && index <= 288.) {
+        gl_Position = vec4(u + 2. * R * zoom.x * cos(radians(ceil((index - 145.) / 2.) * 5.)), v + 2. * R * zoom.y * sin(radians(ceil((index - 145.) / 2.) * 5.)), 0., 1.);
+        
         // Discard every other line to create a dashed line
-        if (mod(index - 1., 4.) <= 1.) {
-            gl_Position = vec4(u + 2. * R * zoom.x * cos(radians(ceil((index - 145.) / 2.) * 5.)), v + 2. * R * zoom.y * sin(radians(ceil((index - 145.) / 2.) * 5.)), 0., 1.);
+        if (mod(index - 1., 4.) > 1.) {
+            alpha = 0.;
         }
     }
 

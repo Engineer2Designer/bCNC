@@ -333,8 +333,8 @@ class CNCCanvas(GLCanvas):
         # Selection Rectangle
         self.SelectionRectVertices = numpy.array([], dtype=numpy.float32)
         # Camera vertices
-        self.CameraRectVertices = numpy.array([1., 2., 3., 1., 3., 4.], dtype=numpy.float32)
-        self.CrossHairVertices = numpy.arange(1, 293, dtype=numpy.float32)
+        self.numCameraRectVertices = 0
+        self.numCrossHairVertices = 0
         
         self.reset()
         self.initGL()
@@ -566,7 +566,9 @@ class CNCCanvas(GLCanvas):
 
         # Fill the buffer of the camera rectangle, which is fixed
         glBindBuffer(GL_ARRAY_BUFFER, self.CameraVBO)
-        glBufferData(GL_ARRAY_BUFFER, self.CameraRectVertices.nbytes, self.CameraRectVertices, GL_STATIC_DRAW)
+        CameraRectVertices = numpy.array([1., 2., 3., 1., 3., 4.], dtype=numpy.float32)
+        self.numCameraRectVertices = CameraRectVertices.nbytes
+        glBufferData(GL_ARRAY_BUFFER, self.numCameraRectVertices, CameraRectVertices, GL_STATIC_DRAW)
         
         # ----- CROSSHAIR PROGRAM ------
         # Program to draw the Camera Crosshair
@@ -585,7 +587,9 @@ class CNCCanvas(GLCanvas):
 
         # Fill the buffer of the crosshair, which is fixed
         glBindBuffer(GL_ARRAY_BUFFER, self.CrossHairVBO)
-        glBufferData(GL_ARRAY_BUFFER, self.CrossHairVertices.nbytes, self.CrossHairVertices, GL_STATIC_DRAW)
+        CrossHairVertices = numpy.arange(1, 293, dtype=numpy.float32)
+        self.numCrossHairVertices = CrossHairVertices.nbytes
+        glBufferData(GL_ARRAY_BUFFER, self.numCrossHairVertices, CrossHairVertices, GL_STATIC_DRAW)
 
 
         glClearColor(1.0, 1.0, 1.0, 1.0)
@@ -2313,11 +2317,11 @@ class CNCCanvas(GLCanvas):
             zoom_loc = glGetUniformLocation(program=self.CrossHairProgram, name="zoom")
             glUniform2f(zoom_loc, zoomx, zoomy)
 
-            cameraScale_loc = glGetUniformLocation(program=self.ImageProgram, name="cameraScale")
+            cameraScale_loc = glGetUniformLocation(program=self.CrossHairProgram, name="cameraScale")
             glUniform1f(cameraScale_loc, self.cameraScale)
 
-            glLineWidth(1)
-            glDrawArrays(GL_LINES, 0, len(self.CrossHairVertices) // PARAMETERS_PER_VERTEX)
+            glLineWidth(1.5)
+            glDrawArrays(GL_LINES, 0, self.numCrossHairVertices // PARAMETERS_PER_VERTEX)
 
             # Ensure that the next items are drawn on top of this
             glClear(GL_DEPTH_BUFFER_BIT)
@@ -3765,6 +3769,7 @@ class CanvasFrame(Frame):
             self.canvas.cameraOn()
         else:
             self.canvas.cameraOff()
+            self.canvas.queueDraw()
 
     # ----------------------------------------------------------------------
     def drawTimeChange(self):
