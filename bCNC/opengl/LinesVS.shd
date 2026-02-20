@@ -1,20 +1,52 @@
 // GLSL ES 1.00
 #version 100
+attribute float id;
 attribute vec3 xyz;
-attribute vec3 color;
-attribute vec2 dash;
-attribute float position;
+attribute float pos;
+attribute float colorValue;
+attribute float dashRatio;
+attribute float flags;
 
-varying vec3 color_;
-varying float position_;
-varying vec2 dash_;
+varying float id_;
+varying float length_;
+varying vec3 color;
+varying float dashRatio_;
+varying float linePos;
 
 uniform mat4 MVP;
+uniform float zoom;
 
 void main() {
     gl_Position = MVP * vec4(xyz, 1);
 
-    color_ = color;
-    dash_ = dash;
-    position_ = position;
+    // Dummy operations, so that the linker does not optimize these variables
+    if (id == -1.0) return;
+    dashRatio_ = dashRatio;
+    linePos = pos;
+
+    // Apply a different color based on whether the path is selected/enabled
+    // No bitwise operations in GLSL 1.0. So we use a workaround
+    bool isSelected = (mod(flags, 2.0) == 1.0);
+    bool isEnabled = (floor(mod(flags / 2.0, 2.0)) == 1.0);
+
+    if (isSelected) {
+        if (isEnabled) {
+            color = vec3(0., 0., 1.); // BLUE
+        }
+        else {
+            color = vec3(0., 0.543, 0.543); // DARK_CYAN
+        }
+    }
+    else {
+        if (isEnabled) {
+            float R = floor(colorValue / 65536.0);
+            float G = floor(mod(floor(colorValue / 256.0), 256.0));
+            float B = mod(colorValue, 256.0);
+
+            color = vec3(R, G, B) / 255.;
+        }
+        else {
+            color = vec3(0.3, 0.3, 0.3); // GRAY
+        }
+    }
 }
