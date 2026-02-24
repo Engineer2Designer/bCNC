@@ -20,11 +20,31 @@ varying vec3 color;     // Color passed to fragment shader
 void main() {
     // All this would have been much easier with newer glsl versions, using geometry shaders.
 
-    float R = floor(colorValue / 65536.0);
-    float G = floor(mod(floor(colorValue / 256.0), 256.0));
-    float B = mod(colorValue, 256.0);
+    // Apply a different color based on whether the path is selected/enabled
+    // No bitwise operations in GLSL 1.0. So we use a workaround
+    bool isSelected = (mod(flags, 2.0) == 1.0);
+    bool isEnabled = (floor(mod(flags / 2.0, 2.0)) == 1.0);
 
-    color = vec3(R, G, B) / 255.;
+    if (isSelected) {
+        if (isEnabled) {
+            color = vec3(0., 0., 1.); // BLUE
+        }
+        else {
+            color = vec3(0., 0.543, 0.543); // DARK_CYAN
+        }
+    }
+    else {
+        if (isEnabled) {
+            float R = floor(colorValue / 65536.0);
+            float G = floor(mod(floor(colorValue / 256.0), 256.0));
+            float B = mod(colorValue, 256.0);
+
+            color = vec3(R, G, B) / 255.;
+        }
+        else {
+            color = vec3(0.3, 0.3, 0.3); // GRAY
+        }
+    }
 
     if (index == 1.) {
         gl_Position = MVP * vec4(location, 1.);

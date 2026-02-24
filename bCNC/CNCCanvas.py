@@ -312,7 +312,8 @@ class CNCCanvas(GLCanvas):
         # dashRatio: 0-1. 1 is solid line
         # Selected: 1 or 0
         self.pathLines = {}
-        self.arrows = {}
+        self.pathArrows = {}
+        self.infoArrows = {}
         self.infoVertices = numpy.array([], dtype=numpy.float32)
         self.pathVertices = numpy.array([], dtype=numpy.float32)
         self.orientLines = {}
@@ -573,7 +574,8 @@ class CNCCanvas(GLCanvas):
         self.ArrowProgram = self.createProgram(ArrowVSCode, ArrowFSCode)
         
         # Create a Vertex Buffer Object (VBO)
-        self.ArrowVBO = glGenBuffers(1)
+        self.pathArrowsVBO = glGenBuffers(1)
+        self.infoArrowsVBO = glGenBuffers(1)
         
         # ----- CROSSHAIR PROGRAM ------
         # Program to draw the Camera Crosshair
@@ -641,6 +643,56 @@ class CNCCanvas(GLCanvas):
     def create_arrow(self, arrows, id, location, direction, width, height, colorRGB, flags = FLAG_ENABLED):
         arrows[id] = [location, direction, width, height, colorRGB, flags]
     
+    def set_arrow(self, arrows, arrowsBuffer, linesVertices, lineId, position, width = 0, height = 0):
+        """
+        Add arrow to a line id from the numpy array linesVertices.
+        Position can be 'none', 'first', 'last' or 'both'
+        """
+
+        if position == 'none':
+            if (lineId + 0.1) in arrows:
+                del arrows[lineId + 0.1]
+
+            if (lineId + 0.2) in arrows:
+                del arrows[lineId + 0.2]
+        
+        else:
+            lines16 = numpy.reshape(linesVertices, (-1, 16))
+            line16 = lines16[lines16[:, 0] == lineId]
+
+            if len(line16) == 0:
+                return
+            
+            if position == 'first' or position == 'both':
+                p_tip = vec3(line16[0, 1:4])
+                p_base = vec3(line16[0, 9:12])
+                dir = p_tip - p_base
+                colorValue = line16[0, 5]
+                R = (int(colorValue) & 0xFF0000) >> 16
+                G = (int(colorValue) & 0xFF00) >> 8
+                B = int(colorValue) & 0xFF
+                colorRGB = [R, G, B]
+                flags = line16[0, 7]
+
+                self.create_arrow(arrows, lineId + 0.1, p_tip, dir, width, height, colorRGB, flags)
+            
+            if position == 'last' or position == 'both':
+                p_tip = vec3(line16[-1, 9:12])
+                p_base = vec3(line16[-1, 1:4])
+                dir = p_tip - p_base
+                colorValue = line16[-1, 5]
+                R = (int(colorValue) & 0xFF0000) >> 16
+                G = (int(colorValue) & 0xFF00) >> 8
+                B = int(colorValue) & 0xFF
+                colorRGB = [R, G, B]
+                flags = line16[-1, 7]
+
+                self.create_arrow(arrows, lineId + 0.2, p_tip, dir, width, height, colorRGB, flags)
+        
+        self.update_arrows_buffer(arrowsBuffer, arrows)
+
+
+    
     def create_oval(self, lines, xyz_bottomleft, xyz_topright, colorRGB, dashRatio, flags = FLAG_ENABLED):
         p_bl = vec3(xyz_bottomleft)
         p_tr = vec3(xyz_topright)
@@ -661,7 +713,7 @@ class CNCCanvas(GLCanvas):
         
         return self.create_line(lines, xyz, colorRGB, dashRatio, flags)
     
-    def update_lines_buffer(self, buffer, lines):        
+    def update_lines_buffer(self, buffer, lines, updateModelDimensions = False):        
         # In order to be compatible with Pi 3, we are using GLSL 1.0. It doesn't allow constant parameters per line in the fragment shader. They are always
         # interpolated between vertices. Then, we must assign the parameter twice, once per vertex, with the same value
         vertexArray = []
@@ -698,20 +750,22 @@ class CNCCanvas(GLCanvas):
                     data[3], # flags
                 ])
                 
-                # TODO: Optimize this
-                maxX = max(max(maxX, xyz[i][0]), xyz[i+1][0])
-                maxY = max(max(maxY, xyz[i][1]), xyz[i+1][1])
-                maxZ = max(max(maxZ, xyz[i][2]), xyz[i+1][2])
-                minX = min(min(minX, xyz[i][0]), xyz[i+1][0])
-                minY = min(min(minY, xyz[i][1]), xyz[i+1][1])
-                minZ = min(min(minZ, xyz[i][2]), xyz[i+1][2])
+                if updateModelDimensions:
+                    # TODO: Optimize this
+                    maxX = max(max(maxX, xyz[i][0]), xyz[i+1][0])
+                    maxY = max(max(maxY, xyz[i][1]), xyz[i+1][1])
+                    maxZ = max(max(maxZ, xyz[i][2]), xyz[i+1][2])
+                    minX = min(min(minX, xyz[i][0]), xyz[i+1][0])
+                    minY = min(min(minY, xyz[i][1]), xyz[i+1][1])
+                    minZ = min(min(minZ, xyz[i][2]), xyz[i+1][2])
 
-        if len(lines) == 0:
-            self._modelCenter = vec3(0, 0, 0)
-            self._modelSize = 100
-        else:
-            self._modelCenter = vec3((maxX + minX) / 2, (maxY + minY) / 2, (maxZ + minZ) / 2)
-            self._modelSize = math.sqrt(math.pow(maxX-minX, 2) + math.pow(maxY-minY, 2) + math.pow(maxZ-minZ, 2))
+        if updateModelDimensions:
+            if len(lines) == 0:
+                self._modelCenter = vec3(0, 0, 0)
+                self._modelSize = 100
+            else:
+                self._modelCenter = vec3((maxX + minX) / 2, (maxY + minY) / 2, (maxZ + minZ) / 2)
+                self._modelSize = math.sqrt(math.pow(maxX-minX, 2) + math.pow(maxY-minY, 2) + math.pow(maxZ-minZ, 2))
         
         vertices = numpy.array(vertexArray, dtype=numpy.float32)
         
@@ -722,6 +776,37 @@ class CNCCanvas(GLCanvas):
 
         return vertices
     
+    def update_arrows_from_lines(self, arrows, arrowsBuffer, linesVertices):
+        """
+        Update arrow color and flags from lines
+        """
+
+        if len(arrows) == 0:
+            return
+        
+        lines16 = numpy.reshape(linesVertices, (-1, 16))
+
+        for arrowId in arrows:
+            lineId = int(arrowId)
+            line16 = lines16[lines16[:, 0] == lineId]
+            if len(line16 > 0):
+                line16 = line16[0]
+                #arrows[id] = [location, direction, width, height, colorRGB, flags]
+
+                # Copy color from line
+                colorValue = line16[5]
+                R = (int(colorValue) & 0xFF0000) >> 16
+                G = (int(colorValue) & 0xFF00) >> 8
+                B = int(colorValue) & 0xFF
+                colorRGB = [R, G, B]
+                arrows[arrowId][4] = colorRGB
+                
+                # Copy flags from line
+                arrows[arrowId][5] = line16[7]
+        
+        self.update_arrows_buffer(arrowsBuffer, arrows)
+
+
     def update_arrows_buffer(self, buffer, arrows):        
         vertexArray = []
         
@@ -1625,7 +1710,7 @@ class CNCCanvas(GLCanvas):
             return end.x, end.y
         elif center is not None: # We clicked on an arc, far from the ends. Return the center point
             center = self.world2Canvas(center)
-            dist_center = distance(vec2(cx, cy), center)
+            #dist_center = distance(vec2(cx, cy), center)
             return center.x, center.y
         else:
             return cx, cy
@@ -1956,10 +2041,10 @@ class CNCCanvas(GLCanvas):
 
     # New approach by onekk https://github.com/vlachoudis/bCNC/issues/1311
     def fit2Screen(self, event=None):
-        """Zoom to Fit to Screen"""
-        # Modify translation of the ModelView Matrix to -modelCenter
-        #self.MVMatrix[3][0] = self.MVMatrix[3][1] = self.MVMatrix[3][2] = 0
-        #self.MVMatrix[3] = vec4(-self._modelCenter, 1)
+        """
+        Zoom to Fit to Screen
+        """
+        
         upVector = inverse(self.MVMatrix) * vec4(0, 1, 0, 0)
         depthVector = inverse(self.MVMatrix) * vec4(0, 0, 1, 0)
         
@@ -2022,9 +2107,9 @@ class CNCCanvas(GLCanvas):
 
         if item is not None and item != self._lastActive:
             if self._lastActive is not None:
-                self.itemconfig(self._lastActive, arrow=NONE)
+                self.set_arrow(self.pathArrows, self.pathArrowsVBO, self.pathVertices, self._lastActive, 'none')
             self._lastActive = item
-            self.itemconfig(self._lastActive, arrow=LAST)
+            self.set_arrow(self.pathArrows, self.pathArrowsVBO, self.pathVertices, self._lastActive, 'last', 10, 10)
 
     # ----------------------------------------------------------------------
     # Display gantry
@@ -2057,13 +2142,13 @@ class CNCCanvas(GLCanvas):
     # ----------------------------------------------------------------------
     def clearSelection(self):
         if self._lastActive is not None:
-            # TODO: self.itemconfig(self._lastActive, arrow=NONE)
+            self.set_arrow(self.pathArrows, self.pathArrowsVBO, self.pathVertices, self._lastActive, 'none')
             self._lastActive = None
         
         self.deselectAll(self.pathVertices, self.pathVBO)
-        """ 
-        self.delete("info")
-        """
+         
+        self.deleteInfo()
+        
 
     # ----------------------------------------------------------------------
     # Highlight selected items
@@ -2084,11 +2169,11 @@ class CNCCanvas(GLCanvas):
                 path = block.path(i)
                 if path:
                     linesAndFlags.append([path, flags])
-
-        """ 
-            self.tag_raise(i) """
         
         self.setFlags(self.pathVertices, FLAG_SELECTED | FLAG_ENABLED, linesAndFlags, self.pathVBO)
+
+        # Update arrows, if any
+        self.update_arrows_from_lines(self.pathArrows, self.pathArrowsVBO, self.pathVertices)
                 
         self.updateMargin()
     
@@ -2118,9 +2203,15 @@ class CNCCanvas(GLCanvas):
                 glBindBuffer(GL_ARRAY_BUFFER, 0)
                 self.queueDraw()
 
-    def deletePaths(self):
-        self.pathLines.clear()
-        self.pathVertices = self.update_lines_buffer(self.pathVBO, self.pathLines)
+    def deleteLines(self, lines, linesVertices, linesBuffer, updateModelDimensions = False):
+        lines.clear()
+        linesVertices = self.update_lines_buffer(linesBuffer, lines, updateModelDimensions)
+
+        return linesVertices
+    
+    def deleteArrows(self, arrows, arrowsBuffer):
+        arrows.clear()
+        self.update_arrows_buffer(arrowsBuffer, arrows)
 
     def deselectAll(self, linesArray, bufferToUpdate = None):
         linesArray16 = linesArray.reshape((-1, 16))
@@ -2173,6 +2264,11 @@ class CNCCanvas(GLCanvas):
         # Clear any previous information
         self.infoLines = {}
 
+        self.deleteArrows(self.infoArrows, self.infoArrowsVBO)
+
+
+        infoArcs = []
+
         for bid in blocks:
             block = self.gcode.blocks[bid]
             xyz = [
@@ -2221,12 +2317,22 @@ class CNCCanvas(GLCanvas):
                 )  # towards up
                 f += df
 
-            self.create_line(
+            infoArcs.append(self.create_line(
                 self.infoLines,
                 xyz,
                 (numpy.array(self.winfo_rgb(INFO_COLOR)) * 255. / 65535.).astype(int),
                 1
-            )
+            ))
+        
+        self.infoVertices = self.update_lines_buffer(self.infoVBO, self.infoLines)
+
+        for arc in infoArcs:
+            self.set_arrow(self.infoArrows, self.infoArrowsVBO, self.infoVertices, arc, 'last', 20, 20)
+
+        self.queueDraw()
+    
+    def deleteInfo(self):
+        self.showInfo([])
 
     # -----------------------------------------------------------------------
     def cameraOn(self, event=None):
@@ -2367,6 +2473,7 @@ class CNCCanvas(GLCanvas):
         glEnable(GL_LINE_SMOOTH)
         glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
         glEnable(GL_CULL_FACE)
+        glDepthFunc(GL_LEQUAL)
         
         # Draw background
         glUseProgram(self.backgroundProgram)
@@ -2514,12 +2621,16 @@ class CNCCanvas(GLCanvas):
             self.drawLines(self.pathVBO, 2)
         
         # Draw arrows
-        if len(self.arrows) > 0:
-            self.drawArrows(self.ArrowVBO)
+        if len(self.pathArrows) > 0:
+            self.drawArrows(self.pathArrowsVBO)
         
         # Draw info lines
         if self.infoVertices.size > 0:
             self.drawLines(self.infoVBO, 2)
+        
+        # Draw info arrows
+        if len(self.infoArrows) > 0:
+            self.drawArrows(self.infoArrowsVBO)
         
         # Draw Text
         if self.textVertices.size > 0:
@@ -2700,7 +2811,7 @@ class CNCCanvas(GLCanvas):
         glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "width"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(8*4))
         glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "height"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(9*4))
         glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "colorValue"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(10*4))
-        #glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "flags"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(11*4))
+        glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "flags"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(11*4))
         #glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "id"))
         glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "index"))
         glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "location"))
@@ -2708,7 +2819,7 @@ class CNCCanvas(GLCanvas):
         glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "width"))
         glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "height"))
         glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "colorValue"))
-        #glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "flags"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "flags"))
 
 
         MVP = self.PMatrix * self.MVMatrix
@@ -2742,7 +2853,7 @@ class CNCCanvas(GLCanvas):
         self.initPosition()
         
         self.createPaths()
-        self.pathVertices = self.update_lines_buffer(self.pathVBO, self.pathLines)
+        self.pathVertices = self.update_lines_buffer(self.pathVBO, self.pathLines, True)
         self.updateGrid()
         self.createAxes()
         self.updateMargin()
@@ -2770,7 +2881,9 @@ class CNCCanvas(GLCanvas):
         
         # TODO: Anything apart from paths must be deleted...?
         #self.delete(ALL)
-        self.deletePaths()
+        self.pathVertices = self.deleteLines(self.pathLines, self.pathVertices, self.pathVBO)
+        self.deleteArrows(self.pathArrows, self.pathArrowsVBO)
+
         self.updateGantry(0, 0, 0)
 
         self._lastInsert = None

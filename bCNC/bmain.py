@@ -2263,8 +2263,7 @@ class Application(Tk, Sender):
         if not items:
             return
         self.canvas.select(items)
-        # TODO: Implement active marker
-        #self.canvas.activeMarker(self.editor.getActive())
+        self.canvas.activeMarker(self.editor.getActive())
 
     # -----------------------------------------------------------------------
     # Create a new file
