@@ -21,7 +21,7 @@ except ImportError:
 
 from OpenGL.GL import *
 from ctypes import c_void_p
-from pyglm.glm import mat4x4, mat3x3, ortho, identity, value_ptr, inverse, translate, rotate, vec2, vec3, vec4, inverse, normalize, lookAt, dot, distance
+from pyglm.glm import mat4x4, mat3x3, ortho, identity, value_ptr, inverse, translate, rotate, vec2, vec3, vec4, inverse, normalize, lookAt, dot, cross, distance, length2
 import os
 
 from tkinter import (
@@ -312,8 +312,10 @@ class CNCCanvas(GLCanvas):
         # dashRatio: 0-1. 1 is solid line
         # Selected: 1 or 0
         self.pathLines = {}
+        self.arrows = {}
         self.infoVertices = numpy.array([], dtype=numpy.float32)
         self.pathVertices = numpy.array([], dtype=numpy.float32)
+        self.orientLines = {}
         self._modelCenter = vec3(0, 0, 0)
         self._modelSize = 100.0
         # Text items
@@ -458,6 +460,7 @@ class CNCCanvas(GLCanvas):
         self.marginsVBO = glGenBuffers(1)
         self.workAreaVBO = glGenBuffers(1)
         self.infoVBO = glGenBuffers(1)
+        self.orientVBO = glGenBuffers(1)
 
         
         # ----- AXES PROGRAM ------
@@ -557,6 +560,21 @@ class CNCCanvas(GLCanvas):
         self.numCameraRectVertices = CameraRectVertices.nbytes
         glBufferData(GL_ARRAY_BUFFER, self.numCameraRectVertices, CameraRectVertices, GL_STATIC_DRAW)
         
+        # ----- ARROW PROGRAM ------
+        # Program to draw arrows
+        # Vertex Shader code
+        with open(openglFolder + "ArrowVS.shd", "r") as file:
+            ArrowVSCode = file.read()
+
+        # Fragment Shader code
+        with open(openglFolder + "ArrowFS.shd", "r") as file:
+            ArrowFSCode = file.read()
+
+        self.ArrowProgram = self.createProgram(ArrowVSCode, ArrowFSCode)
+        
+        # Create a Vertex Buffer Object (VBO)
+        self.ArrowVBO = glGenBuffers(1)
+        
         # ----- CROSSHAIR PROGRAM ------
         # Program to draw the Camera Crosshair
         # Vertex Shader code
@@ -610,7 +628,7 @@ class CNCCanvas(GLCanvas):
         
         return shader_program
         
-    def create_line(self, lines, xyz, colorRGB, dashRatio, flags):
+    def create_line(self, lines, xyz, colorRGB, dashRatio, flags = FLAG_ENABLED):
         # xyz is an array of arrays of 3d coords
         lines[self._line_id] = [xyz, colorRGB, dashRatio, flags]
         
@@ -619,6 +637,29 @@ class CNCCanvas(GLCanvas):
         self._line_id += 1
         
         return id
+    
+    def create_arrow(self, arrows, id, location, direction, width, height, colorRGB, flags = FLAG_ENABLED):
+        arrows[id] = [location, direction, width, height, colorRGB, flags]
+    
+    def create_oval(self, lines, xyz_bottomleft, xyz_topright, colorRGB, dashRatio, flags = FLAG_ENABLED):
+        p_bl = vec3(xyz_bottomleft)
+        p_tr = vec3(xyz_topright)
+        center = (p_bl + p_tr) / 2.
+        Rx = abs(p_tr.x - center.x)
+        Ry = abs(p_tr.y - center.y)
+        
+        xyz = []
+        
+        for angle in range(0, 360, 5):
+            xyz.append([center.x + Rx * numpy.cos(numpy.deg2rad(angle)),
+                        center.y + Ry * numpy.sin(numpy.deg2rad(angle)),
+                        center.z])
+            xyz.append([center.x + Rx * numpy.cos(numpy.deg2rad(angle + 5)),
+                        center.y + Ry * numpy.sin(numpy.deg2rad(angle + 5)),
+                        center.z])
+            
+        
+        return self.create_line(lines, xyz, colorRGB, dashRatio, flags)
     
     def update_lines_buffer(self, buffer, lines):        
         # In order to be compatible with Pi 3, we are using GLSL 1.0. It doesn't allow constant parameters per line in the fragment shader. They are always
@@ -674,7 +715,63 @@ class CNCCanvas(GLCanvas):
         
         vertices = numpy.array(vertexArray, dtype=numpy.float32)
         
-        #glUseProgram(self.shader_program) 
+        glBindBuffer(GL_ARRAY_BUFFER, buffer)
+        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_DYNAMIC_DRAW)
+
+        glBindBuffer(GL_ARRAY_BUFFER, 0)  # Unbind the VBO
+
+        return vertices
+    
+    def update_arrows_buffer(self, buffer, arrows):        
+        vertexArray = []
+        
+        for id, data in arrows.items():
+            colorValue = (data[4][0] << 16) + (data[4][1] << 8) + data[4][2] # RGB
+            
+            vertexArray.extend([
+                # Vertex 1
+                id,
+                1.,
+                data[0][0], # location.x
+                data[0][1], # location.y
+                data[0][2], # location.z
+                data[1][0], # direction.x
+                data[1][1], # direction.y
+                data[1][2], # direction.z
+                data[2], # width
+                data[3], # height
+                colorValue,
+                data[5], # flags
+                # Vertex 2
+                id,
+                2.,
+                data[0][0], # location.x
+                data[0][1], # location.y
+                data[0][2], # location.z
+                data[1][0], # direction.x
+                data[1][1], # direction.y
+                data[1][2], # direction.z
+                data[2], # width
+                data[3], # height
+                colorValue,
+                data[5], # flags
+                # Vertex 3
+                id,
+                3.,
+                data[0][0], # location.x
+                data[0][1], # location.y
+                data[0][2], # location.z
+                data[1][0], # direction.x
+                data[1][1], # direction.y
+                data[1][2], # direction.z
+                data[2], # width
+                data[3], # height
+                colorValue,
+                data[5], # flags
+            ])
+        
+        vertices = numpy.array(vertexArray, dtype=numpy.float32)
+        
         glBindBuffer(GL_ARRAY_BUFFER, buffer)
         glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_DYNAMIC_DRAW)
 
@@ -1462,7 +1559,7 @@ class CNCCanvas(GLCanvas):
         j = self.canvasy(event.y)
         x, y, z = self.canvas2xyz(i, j)
 
-    def get_ends(self, lines, id):
+    def get_ends_and_center(self, lines, id):
         # lines is an array with lines vertex data as self.pathLines
         
         # Reshape to have one line per row. Each row has the info of the 2 vertices (location, ...)
@@ -1472,11 +1569,35 @@ class CNCCanvas(GLCanvas):
         line16 = lines16[lines16[:, 0] == id]
 
         if len(line16) == 1: # Just one row. We picked on a line
-            return vec3(line16[0, 1:4]), vec3(line16[0, 8:12])
+            return vec3(line16[0, 1:4]), vec3(line16[0, 9:12]), None
         
         else: # Multiple rows. We picked on an arc. We return the first point of the first line and the last point of the last line
-            # TODO: return the center of the arc
-            return vec3(line16[0, 1:4]), vec3(line16[-1, 8:12])
+            p_start = vec3(line16[0, 1:4])
+            p_end = vec3(line16[-1, 9:12])
+            
+            # If it's a closed arc (a circle), pick the starting point of the last line, instead of the end point
+            if distance(p_start, p_end) == 0.:
+                p_end = vec3(line16[-1, 1:4])
+            
+            numlines = len(line16)
+            p_mid = vec3(line16[int(numpy.ceil(numlines / 2.)), 1:4])
+            
+            # Compute the arc center
+            SM = p_mid - p_start
+            SE = p_end - p_start
+
+            cross_prod = cross(SM, SE)
+            denom = 2.0 * length2(cross_prod)
+
+            if denom == 0:
+                p_center = None # Points are collinear
+            else:
+                term1 = cross(cross_prod, SM) * length2(SE)
+                term2 = cross(SE, cross_prod) * length2(SM)
+
+                p_center = p_start + (term1 + term2) / denom
+                
+            return p_start, p_end, p_center
 
     # ----------------------------------------------------------------------
     # Snap to the closest point if any
@@ -1490,7 +1611,7 @@ class CNCCanvas(GLCanvas):
             return cx, cy
         
         # Get the ends of the closest line, in canvas coordinates
-        start, end = self.get_ends(self.pathVertices, item)
+        start, end, center = self.get_ends_and_center(self.pathVertices, item)
 
         start = self.world2Canvas(start)
         end = self.world2Canvas(end)
@@ -1498,11 +1619,17 @@ class CNCCanvas(GLCanvas):
         dist_start = distance(vec2(cx, cy), start)
         dist_end = distance(vec2(cx, cy), end)
 
-        if dist_start < dist_end:
+        if dist_start < dist_end and dist_start < CLOSE_DISTANCE:
             return start.x, start.y
-        else:
+        elif dist_end < dist_start and dist_end < CLOSE_DISTANCE:
             return end.x, end.y
-
+        elif center is not None: # We clicked on an arc, far from the ends. Return the center point
+            center = self.world2Canvas(center)
+            dist_center = distance(vec2(cx, cy), center)
+            return center.x, center.y
+        else:
+            return cx, cy
+            
     # ----------------------------------------------------------------------
     # Get margins of selected items
     # ----------------------------------------------------------------------
@@ -2025,12 +2152,15 @@ class CNCCanvas(GLCanvas):
     # Highlight marker that was selected
     # ----------------------------------------------------------------------
     def orientChange(self, marker):
-        self.itemconfig("Orient", width=1)
+        # TODO: implement
+        #self.itemconfig("Orient", width=1)
         if marker >= 0:
             self._orientSelected = marker
             try:
                 for i in self.gcode.orient.paths[self._orientSelected]:
-                    self.itemconfig(i, width=2)
+                    # TODO: Implement
+                    pass
+                    # self.itemconfig(i, width=2)
             except IndexError:
                 self.drawOrient()
         else:
@@ -2056,8 +2186,7 @@ class CNCCanvas(GLCanvas):
             self.create_line(self.infoLines,
                              xyz,
                              (numpy.array(self.winfo_rgb(INFO_COLOR)) * 255. / 65535.).astype(int),
-                             1,
-                             FLAG_ENABLED)
+                             1)
             
             xc = (block.xmin + block.xmax) / 2.0
             yc = (block.ymin + block.ymax) / 2.0
@@ -2096,8 +2225,7 @@ class CNCCanvas(GLCanvas):
                 self.infoLines,
                 xyz,
                 (numpy.array(self.winfo_rgb(INFO_COLOR)) * 255. / 65535.).astype(int),
-                1,
-                FLAG_ENABLED
+                1
             )
 
     # -----------------------------------------------------------------------
@@ -2375,10 +2503,19 @@ class CNCCanvas(GLCanvas):
         if self.draw_workarea:
             self.drawLines(self.workAreaVBO, 1)
         
+        # Draw orient markers
+        glClear(GL_DEPTH_BUFFER_BIT)
+        self.drawLines(self.orientVBO, 5)
+        
+        glClear(GL_DEPTH_BUFFER_BIT)
+        
         # Draw path
         if self.pathVertices.size > 0:
-            glClear(GL_DEPTH_BUFFER_BIT)
             self.drawLines(self.pathVBO, 2)
+        
+        # Draw arrows
+        if len(self.arrows) > 0:
+            self.drawArrows(self.ArrowVBO)
         
         # Draw info lines
         if self.infoVertices.size > 0:
@@ -2550,6 +2687,45 @@ class CNCCanvas(GLCanvas):
         glDrawArrays(GL_LINES, 0, size // PARAMETERS_PER_VERTEX)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
     
+    def drawArrows(self, vbo):
+        glEnable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)
+        glUseProgram(self.ArrowProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, vbo)
+        PARAMETERS_PER_VERTEX = 12
+        #glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "id"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "index"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(1*4))
+        glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "location"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(2*4))
+        glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "dir"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(5*4))
+        glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "width"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(8*4))
+        glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "height"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(9*4))
+        glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "colorValue"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(10*4))
+        #glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "flags"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(11*4))
+        #glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "id"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "index"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "location"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "dir"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "width"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "height"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "colorValue"))
+        #glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "flags"))
+
+
+        MVP = self.PMatrix * self.MVMatrix
+        mv_loc = glGetUniformLocation(program=self.ArrowProgram, name="MVP")
+        glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+        
+        MVPinv = inverse(MVP)
+        mvpinv_loc = glGetUniformLocation(program=self.ArrowProgram, name="MVPinv")
+        glUniformMatrix4fv(mvpinv_loc, 1, False, value_ptr(MVPinv))
+
+        zoom_loc = glGetUniformLocation(program=self.ArrowProgram, name="zoom")
+        glUniform1f(zoom_loc, self.zoom)
+
+        size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
+        glDrawArrays(GL_TRIANGLES, 0, size // PARAMETERS_PER_VERTEX)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+    
     def queueDraw(self):
         if self._drawRequested:
             return
@@ -2581,16 +2757,10 @@ class CNCCanvas(GLCanvas):
         if view is not None:
             self.view = view
 
-        self.drawPaths()
         self.drawProbe()
+        """
         self.drawOrient()
-
-        ij = self.plotCoords([xyz])[0]
-        dx = int(round(self.canvasx(self.winfo_width() / 2) - ij[0]))
-        dy = int(round(self.canvasy(self.winfo_height() / 2) - ij[1]))
-        self.scan_mark(0, 0)
-        self.scan_dragto(int(round(dx)), int(round(dy)), 1) """
-
+        
         self.queueDraw()
 
     # ----------------------------------------------------------------------
@@ -2740,7 +2910,7 @@ class CNCCanvas(GLCanvas):
                 [CNC.vars["xmin"], CNC.vars["ymax"], 0.0],
                 [CNC.vars["xmin"], CNC.vars["ymin"], 0.0]]
         
-            self.create_line(marginLines, xyz, (255, 0, 255), 1, FLAG_ENABLED)
+            self.create_line(marginLines, xyz, (255, 0, 255), 1)
             self.update_lines_buffer(self.marginsVBO, marginLines)
 
         if not CNC.isAllMarginValid():
@@ -2753,7 +2923,7 @@ class CNCCanvas(GLCanvas):
                 [CNC.vars["axmin"], CNC.vars["aymax"], 0.0],
                 [CNC.vars["axmin"], CNC.vars["aymin"], 0.0]]
     
-        self.create_line(marginLines, xyz, (255, 0, 255), 0.66, FLAG_ENABLED)
+        self.create_line(marginLines, xyz, (255, 0, 255), 0.66)
         self.update_lines_buffer(self.marginsVBO, marginLines)
         
         self.queueDraw()
@@ -2823,7 +2993,7 @@ class CNCCanvas(GLCanvas):
             [xmin, ymax, 0.0],
             [xmin, ymin, 0.0]]
     
-        self.create_line(workAreaLines, xyz, (255, 165, 0), 0.661, FLAG_ENABLED)
+        self.create_line(workAreaLines, xyz, (255, 165, 0), 0.661)
         self.update_lines_buffer(self.workAreaVBO, workAreaLines)
         
         self.queueDraw()
@@ -2873,9 +3043,7 @@ class CNCCanvas(GLCanvas):
     # Display orientation markers
     # ----------------------------------------------------------------------
     def drawOrient(self, event=None):
-        self.delete("Orient")
-        if self.view in (VIEW_XZ, VIEW_YZ):
-            return
+        self.orientLines = {}
 
         # Draw orient markers
         if CNC.inch:
@@ -2886,83 +3054,75 @@ class CNCCanvas(GLCanvas):
         self.gcode.orient.clearPaths()
         for i, (xm, ym, x, y) in enumerate(self.gcode.orient.markers):
             paths = []
+            
             # Machine position (cross)
-            item = self.create_line(
-                self.plotCoords([(xm - w, ym, 0.0), (xm + w, ym, 0.0)]),
-                tag="Orient",
-                fill="Green",
-            )
-            self.tag_lower(item)
+            item = self.create_line(self.orientLines,
+                [(xm - w, ym, 0.0), (xm + w, ym, 0.0)],
+                (numpy.array(self.winfo_rgb('Green')) * 255. / 65535.).astype(int),
+                1.)
             paths.append(item)
 
-            item = self.create_line(
-                self.plotCoords([(xm, ym - w, 0.0), (xm, ym + w, 0.0)]),
-                tag="Orient",
-                fill="Green",
-            )
-            self.tag_lower(item)
+            item = self.create_line(self.orientLines,
+                [(xm, ym - w, 0.0), (xm, ym + w, 0.0)],
+                (numpy.array(self.winfo_rgb('Green')) * 255. / 65535.).astype(int),
+                1.)
             paths.append(item)
 
             # GCode position (cross)
-            item = self.create_line(
-                self.plotCoords([(x - w, y, 0.0), (x + w, y, 0.0)]),
-                tag="Orient",
-                fill="Red",
-            )
-            self.tag_lower(item)
+            item = self.create_line(self.orientLines,
+                [(x - w, y, 0.0), (x + w, y, 0.0)],
+                (numpy.array(self.winfo_rgb('Red')) * 255. / 65535.).astype(int),
+                1.)
             paths.append(item)
 
-            item = self.create_line(
-                self.plotCoords([(x, y - w, 0.0), (x, y + w, 0.0)]),
-                tag="Orient",
-                fill="Red",
-            )
-            self.tag_lower(item)
+            item = self.create_line(self.orientLines,
+                [(x, y - w, 0.0), (x, y + w, 0.0)],
+                (numpy.array(self.winfo_rgb('Red')) * 255. / 65535.).astype(int),
+                1.)
             paths.append(item)
 
             # Draw error if any
             try:
                 err = self.gcode.orient.errors[i]
-                item = self.create_oval(
-                    self.plotCoords(
-                        [(xm - err, ym - err, 0.0), (xm + err, ym + err, 0.0)]
-                    ),
-                    tag="Orient",
-                    outline="Red",
-                )
-                self.tag_lower(item)
+                item = self.create_oval(self.orientLines,
+                    (xm - err, ym - err, 0.0),
+                    (xm + err, ym + err, 0.0),
+                    (numpy.array(self.winfo_rgb('Red')) * 255. / 65535.).astype(int),
+                    1.)
                 paths.append(item)
 
                 err = self.gcode.orient.errors[i]
-                item = self.create_oval(
-                    self.plotCoords([(x - err, y - err, 0.0),
-                                     (x + err, y + err, 0.0)]),
-                    tag="Orient",
-                    outline="Red",
-                )
-                self.tag_lower(item)
+                item = self.create_oval(self.orientLines,
+                    (x - err, y - err, 0.0),
+                    (x + err, y + err, 0.0),
+                    (numpy.array(self.winfo_rgb('Red')) * 255. / 65535.).astype(int),
+                    1.)
                 paths.append(item)
             except IndexError:
                 pass
 
             # Connecting line
-            item = self.create_line(
-                self.plotCoords([(xm, ym, 0.0), (x, y, 0.0)]),
-                tag="Orient",
-                fill="Blue",
-                dash=(1, 1),
-            )
-            self.tag_lower(item)
+            item = self.create_line(self.orientLines,
+                [(xm, ym, 0.0), (x, y, 0.0)],
+                (numpy.array(self.winfo_rgb('LightBlue')) * 255. / 65535.).astype(int),
+                0.5)
             paths.append(item)
 
             self.gcode.orient.addPath(paths)
 
+        # TODO: Implement this
+        """
         if self._orientSelected is not None:
             try:
                 for item in self.gcode.orient.paths[self._orientSelected]:
                     self.itemconfig(item, width=2)
             except (IndexError, TclError):
                 pass
+        """
+        
+        self.update_lines_buffer(self.orientVBO, self.orientLines)
+        
+        self.queueDraw()
 
     # ----------------------------------------------------------------------
     # Display probe
