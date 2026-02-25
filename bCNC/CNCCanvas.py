@@ -65,7 +65,7 @@ import bmath
 import Camera
 import tkExtra
 import Utils
-from CNC import CNC
+from CNC import CNC, Probe
 
 # Probe mapping we need PIL and numpy
 try:
@@ -270,6 +270,9 @@ class CNCCanvas(GLCanvas):
         self._probeImage = None
         self._probeTkImage = None
         self._probe = None
+        self.probeMaxZ = 10
+        self.probeMinZ = -10
+        self.probeMaxHeight = 10
 
         self.camera = Camera.Camera("aligncam")
         self.cameraAnchor = CENTER  # Camera anchor location "" for gantry
@@ -532,6 +535,21 @@ class CNCCanvas(GLCanvas):
         self.TextVBO = glGenBuffers(1)
         self.AxesTextVBO = glGenBuffers(1)
         self.ProbeTextVBO = glGenBuffers(1)
+
+        # ----- PROBE MAP PROGRAM ------
+        # Program to draw text
+        # Vertex Shader code
+        with open(openglFolder + "ProbeMapVS.shd", "r") as file:
+            ProbeMapVSCode = file.read()
+
+        # Fragment Shader code
+        with open(openglFolder + "ProbeMapFS.shd", "r") as file:
+            ProbeMapFSCode = file.read()
+
+        self.ProbeMapProgram = self.createProgram(ProbeMapVSCode, ProbeMapFSCode)
+        
+        # Create a Vertex Buffer Object (VBO)
+        self.ProbeMapVBO = glGenBuffers(1)
 
         # ----- IMAGE PROGRAM ------
         # Program to draw images
@@ -1806,6 +1824,24 @@ class CNCCanvas(GLCanvas):
 
         return C1, C2, dist, intersect
 
+    def blue2red(self, v: float, vmin: float, vmax: float) -> vec3:
+        """
+        Return an interpolated RGB tuple, based on the value v between vmin and vmax
+        v==vmin -> blue
+        v==vmax -> red
+        """
+        if vmax <= vmin or v < vmin or v > vmax:
+            return vec3(0, 0, 0)  # fallback
+    
+        t = (v - vmin) / (vmax - vmin)
+        t = max(0, min(1, t))
+
+        R = int(255 * t)
+        G = 0
+        B = int(255 * (1 - t))
+
+        return vec3(R, G, B)
+
     # ----------------------------------------------------------------------
     def pan(self, event):
         if self._mouseAction != ACTION_PAN:
@@ -1995,22 +2031,11 @@ class CNCCanvas(GLCanvas):
         x0 = self.canvasx(0)
         y0 = self.canvasy(0)
 
-        for i in self.find_all():
-            self.scale(i, 0, 0, zoom, zoom)
-
         # Update last insert
         if self._lastGantry:
             self.updateGantry(*self.plotCoords([self._lastGantry])[0])
         else:
             self.updateGantry(0, 0)
-
-        self._updateScrollBars()
-        x0 -= self.canvasx(0)
-        y0 -= self.canvasy(0)
-
-        # Perform pin zoom
-        dx = self.canvasx(x) * (1.0 - zoom)
-        dy = self.canvasy(y) * (1.0 - zoom)
 
         # Drag to new location to center viewport
         self.scan_mark(0, 0)
@@ -2289,7 +2314,7 @@ class CNCCanvas(GLCanvas):
 
             self.create_line(self.infoLines,
                              xyz,
-                             (numpy.array(self.winfo_rgb(INFO_COLOR)) * 255. / 65535.).astype(int),
+                             self.rgb8(INFO_COLOR),
                              1)
             
             xc = (block.xmin + block.xmax) / 2.0
@@ -2328,7 +2353,7 @@ class CNCCanvas(GLCanvas):
             infoArcs.append(self.create_line(
                 self.infoLines,
                 xyz,
-                (numpy.array(self.winfo_rgb(INFO_COLOR)) * 255. / 65535.).astype(int),
+                self.rgb8(INFO_COLOR),
                 1
             ))
         
@@ -2632,10 +2657,12 @@ class CNCCanvas(GLCanvas):
         if len(self.pathArrows) > 0:
             self.drawArrows(self.pathArrowsVBO)
         
-        # Draw probe
+        # Draw probe grid, map and text
         if self.draw_probe:
             self.drawLines(self.probeVBO, 1)
-        
+            self.drawProbeMap()
+            self.drawText(self.ProbeTextVBO)
+
         # Draw info lines
         if self.infoVertices.size > 0:
             self.drawLines(self.infoVBO, 2)
@@ -3198,26 +3225,26 @@ class CNCCanvas(GLCanvas):
             # Machine position (cross)
             item = self.create_line(self.orientLines,
                 [(xm - w, ym, 0.0), (xm + w, ym, 0.0)],
-                (numpy.array(self.winfo_rgb('Green')) * 255. / 65535.).astype(int),
+                self.rgb8('Green'),
                 1.)
             paths.append(item)
 
             item = self.create_line(self.orientLines,
                 [(xm, ym - w, 0.0), (xm, ym + w, 0.0)],
-                (numpy.array(self.winfo_rgb('Green')) * 255. / 65535.).astype(int),
+                self.rgb8('Green'),
                 1.)
             paths.append(item)
 
             # GCode position (cross)
             item = self.create_line(self.orientLines,
                 [(x - w, y, 0.0), (x + w, y, 0.0)],
-                (numpy.array(self.winfo_rgb('Red')) * 255. / 65535.).astype(int),
+                self.rgb8('Red'),
                 1.)
             paths.append(item)
 
             item = self.create_line(self.orientLines,
                 [(x, y - w, 0.0), (x, y + w, 0.0)],
-                (numpy.array(self.winfo_rgb('Red')) * 255. / 65535.).astype(int),
+                self.rgb8('Red'),
                 1.)
             paths.append(item)
 
@@ -3227,7 +3254,7 @@ class CNCCanvas(GLCanvas):
                 item = self.create_oval(self.orientLines,
                     (xm - err, ym - err, 0.0),
                     (xm + err, ym + err, 0.0),
-                    (numpy.array(self.winfo_rgb('Red')) * 255. / 65535.).astype(int),
+                    self.rgb8('Red'),
                     1.)
                 paths.append(item)
 
@@ -3235,7 +3262,7 @@ class CNCCanvas(GLCanvas):
                 item = self.create_oval(self.orientLines,
                     (x - err, y - err, 0.0),
                     (x + err, y + err, 0.0),
-                    (numpy.array(self.winfo_rgb('Red')) * 255. / 65535.).astype(int),
+                    self.rgb8('Red'),
                     1.)
                 paths.append(item)
             except IndexError:
@@ -3244,7 +3271,7 @@ class CNCCanvas(GLCanvas):
             # Connecting line
             item = self.create_line(self.orientLines,
                 [(xm, ym, 0.0), (x, y, 0.0)],
-                (numpy.array(self.winfo_rgb('LightBlue')) * 255. / 65535.).astype(int),
+                self.rgb8('LightBlue'),
                 0.5)
             paths.append(item)
 
@@ -3284,7 +3311,7 @@ class CNCCanvas(GLCanvas):
             item = self.create_line(
                 self.probeLines,
                 xyz,
-                (numpy.array(self.winfo_rgb('Yellow')) * 255. / 65535.).astype(int),
+                self.rgb8('Yellow'),
                 1.)
 
         for y in bmath.frange(probe.ymin, probe.ymax + 0.00001, probe.ystep()):
@@ -3292,76 +3319,133 @@ class CNCCanvas(GLCanvas):
             item = self.create_line(
                 self.probeLines,
                 xyz,
-                (numpy.array(self.winfo_rgb('Yellow')) * 255. / 65535.).astype(int),
+                self.rgb8('Yellow'),
                 1.)
         
         self.update_lines_buffer(self.probeVBO, self.probeLines)
 
+        # Lines for debugging
+        """
+        probe.start = True
+        probe.makeMatrix()
+        probe.points = []
+        probe.add(500, 235, 3.7)
+        probe.add(725, 235, -2.2)
+        """
+
         # Draw probe points
+        # Normalize the map height to a 10% of the minimum map side
+        probeMaxZ = numpy.max(probe.matrix)
+        probeMinZ = numpy.min(probe.matrix)
+        probeMaxHeight = 0.1 * min(probe.xmax - probe.xmin, probe.ymax - probe.ymin)
+        ratioZ = probeMaxHeight / max(abs(probeMaxZ), abs(probeMinZ))
+
         self.probeText = {}
         for i, location in enumerate(probe.points):
             item = self.create_text(
                 self.probeText,
-                location,
+                vec3(location[0], location[1], location[2] * ratioZ),
                 f"{probe.points[i][2]:.{CNC.digits}f}",
-                (numpy.array(self.winfo_rgb(PROBE_TEXT_COLOR)) * 255. / 65535.).astype(int))
+                self.rgb8('Yellow'))
 
         self.update_text_buffer(self.ProbeTextVBO, self.probeText)
 
         # Draw image map if numpy exists
-
-        if (
-            numpy is not None
-            and probe.matrix
-        ):
-            array = numpy.array(list(reversed(probe.matrix)), numpy.float32)
-
-            lw = array.min()
-            hg = array.max()
-            mx = max(abs(hg), abs(lw))
-            # scale should be:
-            #  -mx   .. 0 .. mx
-            #  -127     0    127
-            # -127 = light-blue
-            #    0 = white
-            #  127 = light-red
-            dc = mx / 127.0  # step in colors
-            if abs(dc) < 1e-8:
-                return
-            palette = []
-            for x in bmath.frange(lw, hg + 1e-10, (hg - lw) / 255.0):
-                i = int(math.floor(x / dc))
-                j = i + i >> 1  # 1.5*i
-                if i < 0:
-                    palette.append(0xFF + j)
-                    palette.append(0xFF + j)
-                    palette.append(0xFF)
-                elif i > 0:
-                    palette.append(0xFF)
-                    palette.append(0xFF - j)
-                    palette.append(0xFF - j)
-                else:
-                    palette.append(0xFF)
-                    palette.append(0xFF)
-                    palette.append(0xFF)
-            array = numpy.floor((array - lw) / (hg - lw) * 255)
-            # TODO: Implement
-            """
-            self._probeImage = Image.fromarray(
-                array.astype(numpy.int16)).convert("L")
-            self._probeImage.putpalette(palette)
-
-            # Add transparency for a possible composite operation latter on ISO*
-            self._probeImage = self._probeImage.convert("RGBA")
-            self._probeImage.show()
-            
-            x, y = self._projectProbeImage()
-
-            self._probe = self.create_image(
-                x, y, image=self._probeTkImage, anchor="sw")
-            """
+        if (numpy is not None and probe.matrix):
+            self.update_probe_map_buffer()
 
         self.queueDraw()
+
+    def drawProbeMap(self):
+        glEnable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)
+        glUseProgram(self.ProbeMapProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, self.ProbeMapVBO)
+        PARAMETERS_PER_VERTEX = 4
+        glVertexAttribPointer(glGetAttribLocation(self.ProbeMapProgram, "location"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glVertexAttribPointer(glGetAttribLocation(self.ProbeMapProgram, "colorValue"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(3*4))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ProbeMapProgram, "location"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ProbeMapProgram, "colorValue"))
+
+        MVP = self.PMatrix * self.MVMatrix
+        mv_loc = glGetUniformLocation(program=self.ProbeMapProgram, name="MVP")
+        glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+
+        maxZ_loc = glGetUniformLocation(program=self.ProbeMapProgram, name="maxZ")
+        glUniform1f(maxZ_loc, self.probeMaxZ)
+
+        minZ_loc = glGetUniformLocation(program=self.ProbeMapProgram, name="minZ")
+        glUniform1f(minZ_loc, self.probeMinZ)
+
+        maxHeight_loc = glGetUniformLocation(program=self.ProbeMapProgram, name="maxHeight")
+        glUniform1f(maxHeight_loc, self.probeMaxHeight)
+
+        alpha_loc = glGetUniformLocation(program=self.ProbeMapProgram, name="alpha")
+        glUniform1f(alpha_loc, 0.5)
+
+        size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
+        glDrawArrays(GL_TRIANGLES, 0, size // PARAMETERS_PER_VERTEX)
+
+    def update_probe_map_buffer(self):
+        probe = self.gcode.probe
+
+        self.probeMaxZ = numpy.max(probe.matrix)
+        self.probeMinZ = numpy.min(probe.matrix)
+
+        # Normalize the map height to a 10% of the minimum map side
+        self.probeMaxHeight = 0.1 * min(probe.xmax - probe.xmin, probe.ymax - probe.ymin)
+
+        probeMapData = []
+
+        # Each quad of the map is drawn as two triangles (6 vertices)
+        for j in range(probe.yn - 1):
+            for i in range(probe.xn - 1):
+                color1 = self.blue2red(probe.matrix[j][i], self.probeMinZ, self.probeMaxZ)
+                color2 = self.blue2red(probe.matrix[j][i + 1], self.probeMinZ, self.probeMaxZ)
+                color3 = self.blue2red(probe.matrix[j + 1][i + 1], self.probeMinZ, self.probeMaxZ)
+                color4 = self.blue2red(probe.matrix[j + 1][i], self.probeMinZ, self.probeMaxZ)
+                probeMapData.extend([
+                    # Corner 1
+                    probe.xmin + i * probe.xstep(),
+                    probe.ymin + j * probe.ystep(),
+                    probe.matrix[j][i],
+                    (int(color1.x) << 16) + (int(color1.y) << 8) + int(color1.z),
+                    # Corner 2
+                    probe.xmin + (i + 1) * probe.xstep(),
+                    probe.ymin + j * probe.ystep(),
+                    probe.matrix[j][i + 1],
+                    (int(color2.x) << 16) + (int(color2.y) << 8) + int(color2.z),
+                    # Corner 3
+                    probe.xmin + (i + 1) * probe.xstep(),
+                    probe.ymin + (j + 1) * probe.ystep(),
+                    probe.matrix[j + 1][i + 1],
+                    (int(color3.x) << 16) + (int(color3.y) << 8) + int(color3.z),
+                    # Corner 1
+                    probe.xmin + i * probe.xstep(),
+                    probe.ymin + j * probe.ystep(),
+                    probe.matrix[j][i],
+                    (int(color1.x) << 16) + (int(color1.y) << 8) + int(color1.z),
+                    # Corner 3
+                    probe.xmin + (i + 1) * probe.xstep(),
+                    probe.ymin + (j + 1) * probe.ystep(),
+                    probe.matrix[j + 1][i + 1],
+                    (int(color3.x) << 16) + (int(color3.y) << 8) + int(color3.z),
+                    # Corner 4
+                    probe.xmin + i * probe.xstep(),
+                    probe.ymin + (j + 1) * probe.ystep(),
+                    probe.matrix[j + 1][i],
+                    (int(color4.x) << 16) + (int(color4.y) << 8) + int(color4.z),
+                ])
+
+        probeMapVertices = numpy.array(probeMapData, dtype=numpy.float32)
+
+        glBindBuffer(GL_ARRAY_BUFFER, self.ProbeMapVBO)
+        glBufferData(GL_ARRAY_BUFFER, probeMapVertices.nbytes, probeMapVertices, GL_STATIC_DRAW)
+
+        glBindBuffer(GL_ARRAY_BUFFER, 0)  # Unbind the VBO
+
+        return probeMapVertices
+
 
     # ----------------------------------------------------------------------
     # Create the tkimage for the current projection
@@ -3524,10 +3608,20 @@ class CNCCanvas(GLCanvas):
 
             if self.cnc.gcode == 0:
                 if self.draw_rapid:
-                    return self.create_line(self.pathLines, xyz, (255, 0, 0), 0.5, flags)
+                    return self.create_line(
+                        self.pathLines,
+                        xyz,
+                        (255, 0, 0),
+                        0.5,
+                        flags)
                 
             elif self.draw_paths:
-                return self.create_line(self.pathLines, xyz, (numpy.array(self.winfo_rgb(fill)) * 255. / 65535.).astype(int), 1, flags)
+                return self.create_line(
+                    self.pathLines,
+                    xyz,
+                    self.rgb8(fill),
+                    1,
+                    flags)
             
         return None
 
