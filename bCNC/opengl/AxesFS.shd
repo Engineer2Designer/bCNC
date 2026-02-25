@@ -8,11 +8,9 @@ varying float position_;
 const float dash1 = 6.0; // draw: 6 pixels
 const float dash2 = 2.0; // gap: 2 pixels
 
-uniform float zoom;
-
 void main() {
 
-    float loc = mod(position_ * zoom, dash1 + dash2);
+    float loc = mod(position_, dash1 + dash2);
 
     if (loc <= dash1)
     {

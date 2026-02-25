@@ -157,6 +157,7 @@ CONTROLSHIFT_MASK = SHIFT_MASK | CONTROL_MASK
 CLOSE_DISTANCE = 5
 MAXDIST = 10000
 ZOOM = 1.25
+AXIS_LENGTH = 100 # Coord system axis length in pixels
 
 S60 = math.sin(math.radians(60))
 C60 = math.cos(math.radians(60))
@@ -312,44 +313,38 @@ class CNCCanvas(GLCanvas):
         # dashRatio: 0-1. 1 is solid line
         # Selected: 1 or 0
         self.pathLines = {}
-        self.pathArrows = {}
-        self.infoArrows = {}
+        self.orientLines = {}
+        self.probeLines = {}
+        
         self.infoVertices = numpy.array([], dtype=numpy.float32)
         self.pathVertices = numpy.array([], dtype=numpy.float32)
-        self.orientLines = {}
+         # Grid
+        self.gridVertices = numpy.array([], dtype=numpy.float32)
+        # Selection Rectangle
+        self.SelectionRectVertices = numpy.array([], dtype=numpy.float32)
+        
+        self.pathArrows = {}
+        self.infoArrows = {}
+        
         self._modelCenter = vec3(0, 0, 0)
         self._modelSize = 100.0
         # Text items
         self._text_id = 1
         self.text = {} # text_id[location, text value, color]
+        self.probeText = {}
         # Background gradiend colors
         self.bgColorUp = vec3(0.175, 0.215, 0.392)
         self.bgColorDn = vec3(0.4, 0.4, 0.6)
-
-        # Axes
-        self.numAxesVertices = 0
-        # Gantry
-        self.numGantryVertices = 0
-        # Grid
-        self.gridVertices = numpy.array([], dtype=numpy.float32)
-        # Selection Rectangle
-        self.SelectionRectVertices = numpy.array([], dtype=numpy.float32)
-        # Camera vertices
-        self.numCameraRectVertices = 0
-        self.numCrossHairVertices = 0
         
         self.reset()
         self.initGL()
-        self.createAxes()
-        self.createGantry()
 
         # Data of Texture atlas for text rendering
         self.charOffsetAndWidth = []
         self.create_char_texture("./bCNC/opengl/DejaVuSans.ttf", 12)
-        self.create_text(vec3(100, 0, 0), "X", self.rgb8("White"))
-        self.create_text(vec3(0, 100, 0), "Y", self.rgb8("White"))
-        self.create_text(vec3(0, 0, 100), "Z", self.rgb8("White"))
-        self.update_text_buffer(self.TextVBO, self.text)
+
+        self.createAxes(AXIS_LENGTH)
+        self.createGantry()
 
         self.initPosition()
     
@@ -404,9 +399,9 @@ class CNCCanvas(GLCanvas):
         # Generate Mipmap
         glGenerateMipmap(GL_TEXTURE_2D)
     
-    def create_text(self, location, text, color):
+    def create_text(self, textDict, location, text, color):
         # Color is a tuple or numpy array of three 8bit integers
-        self.text[self._text_id] = [location, text, color]
+        textDict[self._text_id] = [location, text, color]
 
         id = self._text_id
         self._text_id += 1
@@ -462,7 +457,7 @@ class CNCCanvas(GLCanvas):
         self.workAreaVBO = glGenBuffers(1)
         self.infoVBO = glGenBuffers(1)
         self.orientVBO = glGenBuffers(1)
-
+        self.probeVBO = glGenBuffers(1)
         
         # ----- AXES PROGRAM ------
         # Vertex Shader code
@@ -535,6 +530,8 @@ class CNCCanvas(GLCanvas):
         
         # Create a Vertex Buffer Object (VBO)
         self.TextVBO = glGenBuffers(1)
+        self.AxesTextVBO = glGenBuffers(1)
+        self.ProbeTextVBO = glGenBuffers(1)
 
         # ----- IMAGE PROGRAM ------
         # Program to draw images
@@ -558,8 +555,9 @@ class CNCCanvas(GLCanvas):
         # Fill the buffer of the camera rectangle, which is fixed
         glBindBuffer(GL_ARRAY_BUFFER, self.CameraVBO)
         CameraRectVertices = numpy.array([1., 2., 3., 1., 3., 4.], dtype=numpy.float32)
-        self.numCameraRectVertices = CameraRectVertices.nbytes
-        glBufferData(GL_ARRAY_BUFFER, self.numCameraRectVertices, CameraRectVertices, GL_STATIC_DRAW)
+
+        size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
+        glBufferData(GL_ARRAY_BUFFER, size, CameraRectVertices, GL_STATIC_DRAW)
         
         # ----- ARROW PROGRAM ------
         # Program to draw arrows
@@ -595,8 +593,7 @@ class CNCCanvas(GLCanvas):
         # Fill the buffer of the crosshair, which is fixed
         glBindBuffer(GL_ARRAY_BUFFER, self.CrossHairVBO)
         CrossHairVertices = numpy.arange(1, 293, dtype=numpy.float32)
-        self.numCrossHairVertices = CrossHairVertices.nbytes
-        glBufferData(GL_ARRAY_BUFFER, self.numCrossHairVertices, CrossHairVertices, GL_STATIC_DRAW)
+        glBufferData(GL_ARRAY_BUFFER, CrossHairVertices.nbytes, CrossHairVertices, GL_STATIC_DRAW)
 
 
         glClearColor(1.0, 1.0, 1.0, 1.0)
@@ -948,12 +945,14 @@ class CNCCanvas(GLCanvas):
 
                 hOffset += self.charOffsetAndWidth[ord(text[ch])][1]
             
-        self.textVertices = numpy.array(char_data, dtype=numpy.float32)
+        textVertices = numpy.array(char_data, dtype=numpy.float32)
         
         glBindBuffer(GL_ARRAY_BUFFER, buffer)
-        glBufferData(GL_ARRAY_BUFFER, self.textVertices.nbytes, self.textVertices, GL_DYNAMIC_DRAW)
+        glBufferData(GL_ARRAY_BUFFER, textVertices.nbytes, textVertices, GL_DYNAMIC_DRAW)
 
         glBindBuffer(GL_ARRAY_BUFFER, 0)  # Unbind the VBO
+
+        return textVertices
 
     # Calculate arguments for antialiasing
     def antialias_args(self, args, winc=0.5, cw=2):
@@ -1085,13 +1084,13 @@ class CNCCanvas(GLCanvas):
     # ----------------------------------------------------------------------
     def setActionGantry(self, event=None):
         self.setAction(ACTION_GANTRY)
-        self.config(background="seashell")
+        # TODO: #self.config(background="seashell")
         self.status(_("Move CNC gantry to mouse location"))
 
     # ----------------------------------------------------------------------
     def setActionWPOS(self, event=None):
         self.setAction(ACTION_WPOS)
-        self.config(background="ivory")
+        # TODO: # self.config(background="ivory")
         self.status(
             _("Set mouse location as current machine position (X/Y only)"))
 
@@ -1140,16 +1139,28 @@ class CNCCanvas(GLCanvas):
     # Move gantry to mouse location
     # ----------------------------------------------------------------------
     def actionGantry(self, x, y):
-        u, v, w = self.image2Machine(x, y)
-        self.app.goto(u, v, w)
+        xy_w = self.canvas2WorldXY(vec2(x, y)) # self.image2Machine(x, y)
+        
+        if xy_w is not None:
+            self.app.goto(xy_w.x, xy_w.y, 0)
+        else:
+            self.status(
+                _("ERROR: Cannot set Gantry location with the current view (Too parallel to the XY plane)"))
+        
         self.setAction(ACTION_SELECT)
 
     # ----------------------------------------------------------------------
     # Set the work coordinates to mouse location
     # ----------------------------------------------------------------------
     def actionWPOS(self, x, y):
-        u, v, w = self.image2Machine(x, y)
-        self.app.mcontrol._wcsSet(u, v, w)
+        xy_w = self.canvas2WorldXY(vec2(x, y)) # self.image2Machine(x, y)
+        
+        if xy_w is not None:
+            self.app.mcontrol._wcsSet(xy_w.x, xy_w.y, 0)
+        else:
+            self.status(
+                _("ERROR: Cannot set WPOS with the current view (Too parallel to the XY plane)"))
+        
         self.setAction(ACTION_SELECT)
 
     # ----------------------------------------------------------------------
@@ -1261,11 +1272,14 @@ class CNCCanvas(GLCanvas):
 
         # Set coordinate origin
         elif self.action == ACTION_ORIGIN:
-            i = self.canvasx(event.x)
-            j = self.canvasy(event.y)
-            x, y, z = self.canvas2xyz(i, j)
-            self.app.insertCommand(_("origin {:g} {:g} {:g}").format(x, y, z),
+            xy_w = self.canvas2WorldXY(vec2(event.x, event.y))
+            if xy_w is not None:
+                self.app.insertCommand(_("origin {:g} {:g} {:g}").format(xy_w.x, xy_w.y, 0),
                                    True)
+            else:
+                self.status(
+                _("ERROR: Cannot set Origin with the current view (Too parallel to the XY plane)"))
+            
             self.setActionSelect()
 
         elif self.action == ACTION_PAN:
@@ -1382,9 +1396,6 @@ class CNCCanvas(GLCanvas):
         
         # Keep just x and y. Reshape to have starting and end point of each line in the same row
         linesCanvasUnit = pointsCanvasUnit[:, :2].reshape((-1, 4))
-        
-        
-        # TODO: Mention the algorithm used here
 
         dx = linesCanvasUnit[:, 2] - linesCanvasUnit[:, 0]
         dy = linesCanvasUnit[:, 3] - linesCanvasUnit[:, 1]
@@ -1488,9 +1499,6 @@ class CNCCanvas(GLCanvas):
         
         # Keep just x and y. Reshape to have starting and end point of each line in the same row
         linesCanvasUnit = pointsCanvasUnit[:, :2].reshape((-1, 4))
-        
-        
-        # TODO: Mention the algorithm used here
 
         dx = linesCanvasUnit[:, 2] - linesCanvasUnit[:, 0]
         dy = linesCanvasUnit[:, 3] - linesCanvasUnit[:, 1]
@@ -2057,7 +2065,7 @@ class CNCCanvas(GLCanvas):
         width = self.winfo_width()
         height = self.winfo_height()
         
-        self.zoom = min(width, height) / self._modelSize  # TODO: calculate based on model size
+        self.zoom = min(width, height) / self._modelSize
         
         self.PMatrix = ortho(-width / 2.0 / self.zoom, 
                              width / 2.0 / self.zoom, 
@@ -2574,7 +2582,8 @@ class CNCCanvas(GLCanvas):
             glUniform1f(cameraScale_loc, self.cameraScale)
 
             glLineWidth(1.5)
-            glDrawArrays(GL_LINES, 0, self.numCrossHairVertices // PARAMETERS_PER_VERTEX)
+            size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
+            glDrawArrays(GL_LINES, 0, size // PARAMETERS_PER_VERTEX)
 
             # Ensure that the next items are drawn on top of this
             glClear(GL_DEPTH_BUFFER_BIT)
@@ -2614,15 +2623,18 @@ class CNCCanvas(GLCanvas):
         glClear(GL_DEPTH_BUFFER_BIT)
         self.drawLines(self.orientVBO, 5)
         
-        glClear(GL_DEPTH_BUFFER_BIT)
-        
         # Draw path
+        glClear(GL_DEPTH_BUFFER_BIT)
         if self.pathVertices.size > 0:
             self.drawLines(self.pathVBO, 2)
         
         # Draw arrows
         if len(self.pathArrows) > 0:
             self.drawArrows(self.pathArrowsVBO)
+        
+        # Draw probe
+        if self.draw_probe:
+            self.drawLines(self.probeVBO, 1)
         
         # Draw info lines
         if self.infoVertices.size > 0:
@@ -2633,133 +2645,19 @@ class CNCCanvas(GLCanvas):
             self.drawArrows(self.infoArrowsVBO)
         
         # Draw Text
-        if self.textVertices.size > 0:
-            glDisable(GL_DEPTH_TEST)
-            glDisable(GL_CULL_FACE)
-            glUseProgram(self.TextProgram)
-            glBindBuffer(GL_ARRAY_BUFFER, self.TextVBO)
-            PARAMETERS_PER_VERTEX = 10
-            #glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "id"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
-            glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "index"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(1*4))
-            glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "location"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(2*4))
-            glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "hOffset"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(5*4))
-            glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "charoffset"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(6*4))
-            glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "charwidth"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(7*4))
-            glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "charheight"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(8*4))
-            glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "colorValue"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(9*4))
-            #glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "id"))
-            glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "index"))
-            glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "location"))
-            glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "hOffset"))
-            glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "charoffset"))
-            glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "charwidth"))
-            glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "charheight"))
-            glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "colorValue"))
-
-            MVP = self.PMatrix * self.MVMatrix
-            mv_loc = glGetUniformLocation(program=self.TextProgram, name="MVP")
-            glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
-
-            textAtlasWidth_loc = glGetUniformLocation(program=self.TextProgram, name="textAtlasWidth")
-            glUniform1f(textAtlasWidth_loc, len(self.charTextureAtlas[0]))
-
-            canvasWidth_loc = glGetUniformLocation(program=self.TextProgram, name="canvasWidth")
-            glUniform1f(canvasWidth_loc, self.winfo_width())
-            canvasHeight_loc = glGetUniformLocation(program=self.TextProgram, name="canvasHeight")
-            glUniform1f(canvasHeight_loc, self.winfo_height())
-
-            # Set the uniform variable 'ourTexture' to texture unit 0
-            glActiveTexture(GL_TEXTURE0)
-            glBindTexture(GL_TEXTURE_2D, self.textTexture)
-            glUniform1i(glGetUniformLocation(self.TextProgram, "ourTexture"), 0)
-
-            glDrawArrays(GL_TRIANGLES, 0, int(len(self.textVertices) // PARAMETERS_PER_VERTEX))
+        if len(self.text) > 0:
+            self.drawText(self.TextVBO)
 
         # Draw axes
         if self.draw_axes:
-            glDisable(GL_DEPTH_TEST)
-            glUseProgram(self.axesProgram)
-            glBindBuffer(GL_ARRAY_BUFFER, self.axesVBO)
-            PARAMETERS_PER_VERTEX = 5
-            glVertexAttribPointer(glGetAttribLocation(self.axesProgram, "xyz"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
-            glVertexAttribPointer(glGetAttribLocation(self.axesProgram, "position"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(3*4))
-            glVertexAttribPointer(glGetAttribLocation(self.axesProgram, "axis"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(4*4))
-            glEnableVertexAttribArray(glGetAttribLocation(self.axesProgram, "xyz"))
-            glEnableVertexAttribArray(glGetAttribLocation(self.axesProgram, "position"))
-            glEnableVertexAttribArray(glGetAttribLocation(self.axesProgram, "axis"))
-            
-            MVP = self.PMatrix * self.MVMatrix
-            mv_loc = glGetUniformLocation(program=self.axesProgram, name="MVP")
-            glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
-            
-            zoom_loc = glGetUniformLocation(program=self.axesProgram, name="zoom")
-            glUniform1f(zoom_loc, self.zoom)
-            
-            glLineWidth(2)
-            glEnable(GL_LINE_SMOOTH)
-            glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
-            glDrawArrays(GL_LINES, 0, self.numAxesVertices // PARAMETERS_PER_VERTEX)
-            glBindBuffer(GL_ARRAY_BUFFER, 0)
+            self.drawAxes()
         
         # Draw gantry
-        glUseProgram(self.gantryProgram)
-        glEnable(GL_CULL_FACE)
-        glBindBuffer(GL_ARRAY_BUFFER, self.gantryVBO)
-        PARAMETERS_PER_VERTEX = 6
-        glVertexAttribPointer(glGetAttribLocation(self.gantryProgram, "xyz"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
-        glVertexAttribPointer(glGetAttribLocation(self.gantryProgram, "normal"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(3*4))
-        glEnableVertexAttribArray(glGetAttribLocation(self.gantryProgram, "xyz"))
-        glEnableVertexAttribArray(glGetAttribLocation(self.gantryProgram, "normal"))
-        
-        MVP = self.PMatrix * self.MVMatrix
-        mv_loc = glGetUniformLocation(program=self.gantryProgram, name="MVP")
-        glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
-        
-        location_loc = glGetUniformLocation(program=self.gantryProgram, name="location")
-        glUniform3fv(location_loc, 1, value_ptr(self._gantryLocation))
-        
-        light1dir = normalize(inverse(MVP) * vec4(1.0, -0.25, -1.0, 0)).xyz
-        light2dir = normalize(inverse(MVP) * vec4(-0.5, -0.125, -0.5, 0)).xyz
-        
-        light1dir_loc = glGetUniformLocation(program=self.gantryProgram, name="light1dir")
-        glUniform3fv(light1dir_loc, 1, value_ptr(light1dir))
-        light2dir_loc = glGetUniformLocation(program=self.gantryProgram, name="light2dir")
-        glUniform3fv(light2dir_loc, 1, value_ptr(light2dir))
-
-        diameter = max(6., CNC.vars["diameter"])
-        diameter_loc = glGetUniformLocation(program=self.gantryProgram, name="diameter")
-        glUniform1f(diameter_loc, diameter)
-        
-        glLineWidth(2)
-        glEnable(GL_LINE_SMOOTH)
-        glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
-        glDrawArrays(GL_TRIANGLES, 0, self.numGantryVertices // PARAMETERS_PER_VERTEX)
-        glBindBuffer(GL_ARRAY_BUFFER, 0)
+        self.drawGantry()
         
         # Draw selection rectangle
         if self._mouseAction == ACTION_SELECT_AREA:
-            glDisable(GL_CULL_FACE)
-            glUseProgram(self.SelectionRectProgram)
-            glBindBuffer(GL_ARRAY_BUFFER, self.SelectionRectVBO)
-            PARAMETERS_PER_VERTEX = 2
-            glVertexAttribPointer(glGetAttribLocation(self.SelectionRectProgram, "uv"), 2, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
-            glEnableVertexAttribArray(glGetAttribLocation(self.SelectionRectProgram, "uv"))
-            
-            # Selection to the right -> Blue. To the left -> Green
-            if self.SelectionRectVertices[2] > self.SelectionRectVertices[0]:
-                rect_color = vec3(0, 0, 1)
-            else:
-                rect_color = vec3(0, 1, 0)
-            color_loc = glGetUniformLocation(program=self.SelectionRectProgram, name="color")
-            glUniform3fv(color_loc, 1, value_ptr(rect_color))
-            
-            glLineWidth(2)
-            glEnable(GL_LINE_SMOOTH)
-            glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
-            
-            glDrawArrays(GL_TRIANGLES, 0, len(self.SelectionRectVertices) // PARAMETERS_PER_VERTEX)
-            glBindBuffer(GL_ARRAY_BUFFER, 0)
-
+            self.drawSelectionRectangle()
 
         glUseProgram(0)
         
@@ -2767,6 +2665,29 @@ class CNCCanvas(GLCanvas):
         
         self._drawRequested = False
     
+    def drawSelectionRectangle(self):
+        glDisable(GL_CULL_FACE)
+        glUseProgram(self.SelectionRectProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, self.SelectionRectVBO)
+        PARAMETERS_PER_VERTEX = 2
+        glVertexAttribPointer(glGetAttribLocation(self.SelectionRectProgram, "uv"), 2, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glEnableVertexAttribArray(glGetAttribLocation(self.SelectionRectProgram, "uv"))
+        
+        # Selection to the right -> Blue. To the left -> Green
+        if self.SelectionRectVertices[2] > self.SelectionRectVertices[0]:
+            rect_color = vec3(0, 0, 1)
+        else:
+            rect_color = vec3(0, 1, 0)
+        color_loc = glGetUniformLocation(program=self.SelectionRectProgram, name="color")
+        glUniform3fv(color_loc, 1, value_ptr(rect_color))
+        
+        glLineWidth(2)
+        glEnable(GL_LINE_SMOOTH)
+        glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
+        
+        glDrawArrays(GL_TRIANGLES, 0, len(self.SelectionRectVertices) // PARAMETERS_PER_VERTEX)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+
     def drawLines(self, vbo, lineWidth):
         glEnable(GL_DEPTH_TEST)
         glUseProgram(self.linesProgram)
@@ -2798,6 +2719,42 @@ class CNCCanvas(GLCanvas):
         glDrawArrays(GL_LINES, 0, size // PARAMETERS_PER_VERTEX)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
     
+    def drawGantry(self):
+        glUseProgram(self.gantryProgram)
+        glEnable(GL_CULL_FACE)
+        glBindBuffer(GL_ARRAY_BUFFER, self.gantryVBO)
+        PARAMETERS_PER_VERTEX = 6
+        glVertexAttribPointer(glGetAttribLocation(self.gantryProgram, "xyz"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glVertexAttribPointer(glGetAttribLocation(self.gantryProgram, "normal"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(3*4))
+        glEnableVertexAttribArray(glGetAttribLocation(self.gantryProgram, "xyz"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.gantryProgram, "normal"))
+        
+        MVP = self.PMatrix * self.MVMatrix
+        mv_loc = glGetUniformLocation(program=self.gantryProgram, name="MVP")
+        glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+        
+        location_loc = glGetUniformLocation(program=self.gantryProgram, name="location")
+        glUniform3fv(location_loc, 1, value_ptr(self._gantryLocation))
+        
+        light1dir = normalize(inverse(MVP) * vec4(1.0, -0.25, -1.0, 0)).xyz
+        light2dir = normalize(inverse(MVP) * vec4(-0.5, -0.125, -0.5, 0)).xyz
+        
+        light1dir_loc = glGetUniformLocation(program=self.gantryProgram, name="light1dir")
+        glUniform3fv(light1dir_loc, 1, value_ptr(light1dir))
+        light2dir_loc = glGetUniformLocation(program=self.gantryProgram, name="light2dir")
+        glUniform3fv(light2dir_loc, 1, value_ptr(light2dir))
+
+        diameter = max(6., CNC.vars["diameter"])
+        diameter_loc = glGetUniformLocation(program=self.gantryProgram, name="diameter")
+        glUniform1f(diameter_loc, diameter)
+        
+        glLineWidth(2)
+        glEnable(GL_LINE_SMOOTH)
+        glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
+        size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
+        glDrawArrays(GL_TRIANGLES, 0, size // PARAMETERS_PER_VERTEX)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+
     def drawArrows(self, vbo):
         glEnable(GL_DEPTH_TEST)
         glDisable(GL_CULL_FACE)
@@ -2837,6 +2794,81 @@ class CNCCanvas(GLCanvas):
         glDrawArrays(GL_TRIANGLES, 0, size // PARAMETERS_PER_VERTEX)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
     
+    def drawAxes(self):
+        glDisable(GL_DEPTH_TEST)
+        glUseProgram(self.axesProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, self.axesVBO)
+        PARAMETERS_PER_VERTEX = 5
+        glVertexAttribPointer(glGetAttribLocation(self.axesProgram, "xyz"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glVertexAttribPointer(glGetAttribLocation(self.axesProgram, "position"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(3*4))
+        glVertexAttribPointer(glGetAttribLocation(self.axesProgram, "axis"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(4*4))
+        glEnableVertexAttribArray(glGetAttribLocation(self.axesProgram, "xyz"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.axesProgram, "position"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.axesProgram, "axis"))
+        
+        MVP = self.PMatrix * self.MVMatrix
+        mv_loc = glGetUniformLocation(program=self.axesProgram, name="MVP")
+        glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+        
+        zoom_loc = glGetUniformLocation(program=self.axesProgram, name="zoom")
+        glUniform1f(zoom_loc, self.zoom)
+        
+        glLineWidth(2)
+        glEnable(GL_LINE_SMOOTH)
+        glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
+        size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
+        glDrawArrays(GL_LINES, 0, size // PARAMETERS_PER_VERTEX)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+        # Draw axes text. Update text location with the current zoom
+        self.axesText[1][0] = vec3(AXIS_LENGTH / self.zoom, 0, 0)
+        self.axesText[2][0] = vec3(0, AXIS_LENGTH / self.zoom, 0)
+        self.axesText[3][0] = vec3(0, 0, AXIS_LENGTH / self.zoom)
+        self.update_text_buffer(self.AxesTextVBO, self.axesText)
+        self.drawText(self.AxesTextVBO)
+    
+    def drawText(self, textBuffer):
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)
+        glUseProgram(self.TextProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, textBuffer)
+        PARAMETERS_PER_VERTEX = 10
+        #glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "id"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "index"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(1*4))
+        glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "location"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(2*4))
+        glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "hOffset"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(5*4))
+        glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "charoffset"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(6*4))
+        glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "charwidth"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(7*4))
+        glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "charheight"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(8*4))
+        glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "colorValue"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(9*4))
+        #glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "id"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "index"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "location"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "hOffset"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "charoffset"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "charwidth"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "charheight"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "colorValue"))
+
+        MVP = self.PMatrix * self.MVMatrix
+        mv_loc = glGetUniformLocation(program=self.TextProgram, name="MVP")
+        glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+
+        textAtlasWidth_loc = glGetUniformLocation(program=self.TextProgram, name="textAtlasWidth")
+        glUniform1f(textAtlasWidth_loc, len(self.charTextureAtlas[0]))
+
+        canvasWidth_loc = glGetUniformLocation(program=self.TextProgram, name="canvasWidth")
+        glUniform1f(canvasWidth_loc, self.winfo_width())
+        canvasHeight_loc = glGetUniformLocation(program=self.TextProgram, name="canvasHeight")
+        glUniform1f(canvasHeight_loc, self.winfo_height())
+
+        # Set the uniform variable 'ourTexture' to texture unit 0
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, self.textTexture)
+        glUniform1i(glGetUniformLocation(self.TextProgram, "ourTexture"), 0)
+        size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
+        glDrawArrays(GL_TRIANGLES, 0, size // PARAMETERS_PER_VERTEX)
+        
     def queueDraw(self):
         if self._drawRequested:
             return
@@ -2855,7 +2887,6 @@ class CNCCanvas(GLCanvas):
         self.createPaths()
         self.pathVertices = self.update_lines_buffer(self.pathVBO, self.pathLines, True)
         self.updateGrid()
-        self.createAxes()
         self.updateMargin()
         self.updateWorkArea()
 
@@ -2868,8 +2899,9 @@ class CNCCanvas(GLCanvas):
         if view is not None:
             self.view = view
 
-        self.drawProbe()
         """
+        self.drawProbe()
+
         self.drawOrient()
         
         self.queueDraw()
@@ -2946,46 +2978,41 @@ class CNCCanvas(GLCanvas):
                 0, 0, 1])
         
         gantryVertices = numpy.array(vertices, dtype=numpy.float32)
-        self.numGantryVertices = gantryVertices.nbytes
         
         glBindBuffer(GL_ARRAY_BUFFER, self.gantryVBO)
-        glBufferData(GL_ARRAY_BUFFER, self.numGantryVertices, gantryVertices, GL_STATIC_DRAW)
+        glBufferData(GL_ARRAY_BUFFER, gantryVertices.nbytes, gantryVertices, GL_STATIC_DRAW)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
 
     # ----------------------------------------------------------------------
     # Create system axes
     # ----------------------------------------------------------------------
-    def createAxes(self):
-        dx = CNC.vars["axmax"] - CNC.vars["axmin"]
-        dy = CNC.vars["aymax"] - CNC.vars["aymin"]
-        d = min(dx, dy)
-        try:
-            s = math.pow(10.0, int(math.log10(d)))
-        except Exception:
-            if CNC.inch:
-                s = 10.0
-            else:
-                s = 100.0
+    def createAxes(self, axisLength):
         
         axesVertices = numpy.array([
             # X axis
             0, 0, 0, # Start Point
             0, # position. 0 for the first point of the line and length for the second. Used for dashed lines
             1, # Axis X
-            s, 0, 0, # End Point
-            s, # position. 0 for the first point of the line and length for the second. Used for dashed lines
+            axisLength, 0, 0, # End Point
+            axisLength, # position. 0 for the first point of the line and length for the second. Used for dashed lines
             1, # Axis X
             # Y axis
-            0, 0, 0, 0, 2, 0, s, 0, s, 2,
+            0, 0, 0, 0, 2, 0, axisLength, 0, axisLength, 2,
             # Z axis          
-            0, 0, 0, 0, 3, 0, 0, s, s, 3
+            0, 0, 0, 0, 3, 0, 0, axisLength, axisLength, 3
         ], dtype=numpy.float32)
-
-        self.numAxesVertices = axesVertices.nbytes
         
         glBindBuffer(GL_ARRAY_BUFFER, self.axesVBO)
-        glBufferData(GL_ARRAY_BUFFER, self.numAxesVertices, axesVertices, GL_STATIC_DRAW)
+        glBufferData(GL_ARRAY_BUFFER, axesVertices.nbytes, axesVertices, GL_STATIC_DRAW)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+        # Text (x, y, z)
+        self.axesText = {
+            1: [vec3(axisLength * self.zoom, 0, 0), "X", self.rgb8("White")],
+            2: [vec3(0, axisLength * self.zoom, 0), "Y", self.rgb8("White")],
+            3: [vec3(0, 0, axisLength * self.zoom), "Z", self.rgb8("White")]
+            }
+        self.update_text_buffer(self.AxesTextVBO, self.axesText)
 
     # Update the selection rectangle
     def updateSelectionRect(self, x1, y1, x2, y2):
@@ -3241,13 +3268,13 @@ class CNCCanvas(GLCanvas):
     # Display probe
     # ----------------------------------------------------------------------
     def drawProbe(self):
-        self.delete("Probe")
+        self.probeLines = {}
+        #self.delete("Probe")
         if self._probe:
-            self.delete(self._probe)
+            #self.delete(self._probe)
             self._probe = None
         if not self.draw_probe:
-            return
-        if self.view in (VIEW_XZ, VIEW_YZ):
+            self.queueDraw()
             return
 
         # Draw probe grid
@@ -3255,31 +3282,37 @@ class CNCCanvas(GLCanvas):
         for x in bmath.frange(probe.xmin, probe.xmax + 0.00001, probe.xstep()):
             xyz = [(x, probe.ymin, 0.0), (x, probe.ymax, 0.0)]
             item = self.create_line(
-                self.plotCoords(xyz), tag="Probe", fill="Yellow")
-            self.tag_lower(item)
+                self.probeLines,
+                xyz,
+                (numpy.array(self.winfo_rgb('Yellow')) * 255. / 65535.).astype(int),
+                1.)
 
         for y in bmath.frange(probe.ymin, probe.ymax + 0.00001, probe.ystep()):
             xyz = [(probe.xmin, y, 0.0), (probe.xmax, y, 0.0)]
             item = self.create_line(
-                self.plotCoords(xyz), tag="Probe", fill="Yellow")
-            self.tag_lower(item)
+                self.probeLines,
+                xyz,
+                (numpy.array(self.winfo_rgb('Yellow')) * 255. / 65535.).astype(int),
+                1.)
+        
+        self.update_lines_buffer(self.probeVBO, self.probeLines)
 
         # Draw probe points
-        for i, uv in enumerate(self.plotCoords(probe.points)):
+        self.probeText = {}
+        for i, location in enumerate(probe.points):
             item = self.create_text(
-                uv,
-                text=f"{probe.points[i][2]:.{CNC.digits}f}",
-                tag="Probe",
-                justify=CENTER,
-                fill=PROBE_TEXT_COLOR,
-            )
-            self.tag_lower(item)
+                self.probeText,
+                location,
+                f"{probe.points[i][2]:.{CNC.digits}f}",
+                (numpy.array(self.winfo_rgb(PROBE_TEXT_COLOR)) * 255. / 65535.).astype(int))
+
+        self.update_text_buffer(self.ProbeTextVBO, self.probeText)
 
         # Draw image map if numpy exists
+
         if (
             numpy is not None
             and probe.matrix
-            and self.view in (VIEW_XY, VIEW_ISO1, VIEW_ISO2, VIEW_ISO3)
         ):
             array = numpy.array(list(reversed(probe.matrix)), numpy.float32)
 
@@ -3312,18 +3345,23 @@ class CNCCanvas(GLCanvas):
                     palette.append(0xFF)
                     palette.append(0xFF)
             array = numpy.floor((array - lw) / (hg - lw) * 255)
+            # TODO: Implement
+            """
             self._probeImage = Image.fromarray(
                 array.astype(numpy.int16)).convert("L")
             self._probeImage.putpalette(palette)
 
             # Add transparency for a possible composite operation latter on ISO*
             self._probeImage = self._probeImage.convert("RGBA")
-
+            self._probeImage.show()
+            
             x, y = self._projectProbeImage()
 
             self._probe = self.create_image(
                 x, y, image=self._probeTkImage, anchor="sw")
-            self.tag_lower(self._probe)
+            """
+
+        self.queueDraw()
 
     # ----------------------------------------------------------------------
     # Create the tkimage for the current projection
@@ -3849,7 +3887,6 @@ class CanvasFrame(Frame):
 
     # ----------------------------------------------------------------------
     def viewChange(self, a=None, b=None, c=None):
-        # TODO: Change the view without fitting the screen. Show the current area instead
         view = VIEWS.index(self.view.get())
 
         self.canvas.MVMatrix = mat4x4(self.canvas.MVMatrix)
@@ -3928,8 +3965,7 @@ class CanvasFrame(Frame):
         if value is not None:
             self.draw_axes.set(value)
         self.canvas.draw_axes = self.draw_axes.get()
-        self.canvas.createAxes()
-        self.after('idle', self.canvas.draw)
+        self.canvas.queueDraw()
 
     # ----------------------------------------------------------------------
     def drawGrid(self, value=None):
