@@ -318,6 +318,7 @@ class CNCCanvas(GLCanvas):
         self.pathLines = {}
         self.orientLines = {}
         self.probeLines = {}
+        self.vectorLines = {}
         
         self.infoVertices = numpy.array([], dtype=numpy.float32)
         self.pathVertices = numpy.array([], dtype=numpy.float32)
@@ -1218,8 +1219,8 @@ class CNCCanvas(GLCanvas):
             self._mouseAction = ACTION_SELECT_SINGLE
 
         elif self.action in (ACTION_MOVE, ACTION_RULER):
-            i = self.canvasx(event.x)
-            j = self.canvasy(event.y)
+            i = event.x
+            j = event.y
             if self.action == ACTION_RULER and self._vector is not None:
                 # Check if we hit the existing ruler
                 coords = self.coords(self._vector)
@@ -1247,18 +1248,13 @@ class CNCCanvas(GLCanvas):
                 # Check if we clicked on a selected item
                 try:
                     for item in self.find_overlapping(
-                        i - CLOSE_DISTANCE,
-                        j - CLOSE_DISTANCE,
-                        i + CLOSE_DISTANCE,
-                        j + CLOSE_DISTANCE,
+                        event.x - CLOSE_DISTANCE,
+                        event.y - CLOSE_DISTANCE,
+                        event.x + CLOSE_DISTANCE,
+                        event.y + CLOSE_DISTANCE,
+                        self.pathVertices
                     ):
-                        tags = self.gettags(item)
-                        if (
-                            "sel" in tags
-                            or "sel2" in tags
-                            or "sel3" in tags
-                            or "sel4" in tags
-                        ):
+                        if self.isSelected(item, self.pathVertices):
                             break
                     else:
                         self._mouseAction = ACTION_SELECT_SINGLE
@@ -1271,9 +1267,12 @@ class CNCCanvas(GLCanvas):
             else:
                 fill = RULER_COLOR
                 arrow = BOTH
+            self._vector = self.create_line(self.vectorLines,)
+            """
             self._vector = self.create_line(
                 (i, j, i, j), fill=fill, arrow=arrow)
             self._vx0, self._vy0, self._vz0 = self.canvas2xyz(i, j)
+            """
             self._mouseAction = self.action
 
         # Move gantry to position
@@ -1302,6 +1301,9 @@ class CNCCanvas(GLCanvas):
 
         elif self.action == ACTION_PAN:
             self.pan(event)
+
+    def isSelected(self, lineId, lineVertices):
+
 
     def midClick(self, event):
         self._x = event.x
