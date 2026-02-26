@@ -315,15 +315,14 @@ class CNCCanvas(GLCanvas):
         # item: [x1, y1, z1, x2, y2, z2, dashRatio, selected]
         # dashRatio: 0-1. 1 is solid line
         # Selected: 1 or 0
-        self.pathLines = {}
-        self.orientLines = {}
-        self.probeLines = {}
-        self.vectorLines = {}
+        self.pathDict = {}
+        self.orientDict = {}
+        self.probeDict = {}
+        self.vectorDict = {}
         
         self.infoVertices = numpy.array([], dtype=numpy.float32)
         self.pathVertices = numpy.array([], dtype=numpy.float32)
-         # Grid
-        self.gridVertices = numpy.array([], dtype=numpy.float32)
+
         # Selection Rectangle
         self.SelectionRectVertices = numpy.array([], dtype=numpy.float32)
         
@@ -413,6 +412,8 @@ class CNCCanvas(GLCanvas):
         return id
 
     def initGL(self):
+        # Create all the OpenGL shader programs
+
         # ----- BACKGROUND PROGRAM ------
         # Vertex Shader code
         with open(openglFolder + "BackgroundVS.shd", "r") as file:
@@ -462,6 +463,8 @@ class CNCCanvas(GLCanvas):
         self.infoVBO = glGenBuffers(1)
         self.orientVBO = glGenBuffers(1)
         self.probeVBO = glGenBuffers(1)
+        self.vectorVBO = glGenBuffers(1)
+        self.gridVBO = glGenBuffers(1)
         
         # ----- AXES PROGRAM ------
         # Vertex Shader code
@@ -490,20 +493,6 @@ class CNCCanvas(GLCanvas):
         
         # Create a Vertex Buffer Object (VBO)
         self.gantryVBO = glGenBuffers(1)
-        
-        # ----- GRID PROGRAM ------
-        # Vertex Shader code
-        with open(openglFolder + "GridVS.shd", "r") as file:
-            GridVSCode = file.read()
-
-        # Fragment Shader code
-        with open(openglFolder + "GridFS.shd", "r") as file:
-            GridFSCode = file.read()
-
-        self.gridProgram = self.createProgram(GridVSCode, GridFSCode)
-        
-        # Create a Vertex Buffer Object (VBO)
-        self.gridVBO = glGenBuffers(1)
 
         # ----- SELECTION RECT PROGRAM ------
         # Program to draw the selection rectangle
@@ -574,9 +563,7 @@ class CNCCanvas(GLCanvas):
         # Fill the buffer of the camera rectangle, which is fixed
         glBindBuffer(GL_ARRAY_BUFFER, self.CameraVBO)
         CameraRectVertices = numpy.array([1., 2., 3., 1., 3., 4.], dtype=numpy.float32)
-
-        size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
-        glBufferData(GL_ARRAY_BUFFER, size, CameraRectVertices, GL_STATIC_DRAW)
+        glBufferData(GL_ARRAY_BUFFER, CameraRectVertices.nbytes, CameraRectVertices, GL_STATIC_DRAW)
         
         # ----- ARROW PROGRAM ------
         # Program to draw arrows
@@ -646,9 +633,9 @@ class CNCCanvas(GLCanvas):
         
         return shader_program
         
-    def create_line(self, lines, xyz, colorRGB, dashRatio, flags = FLAG_ENABLED):
+    def create_line(self, linesDict, xyz, colorRGB, dashRatio, flags = FLAG_ENABLED):
         # xyz is an array of arrays of 3d coords
-        lines[self._line_id] = [xyz, colorRGB, dashRatio, flags]
+        linesDict[self._line_id] = [xyz, colorRGB, dashRatio, flags]
         
         id = self._line_id
         # Increment the line id for the next line
@@ -729,7 +716,7 @@ class CNCCanvas(GLCanvas):
         
         return self.create_line(lines, xyz, colorRGB, dashRatio, flags)
     
-    def update_lines_buffer(self, buffer, lines, updateModelDimensions = False):        
+    def update_lines_buffer(self, buffer, linesDict, updateModelDimensions = False):        
         # In order to be compatible with Pi 3, we are using GLSL 1.0. It doesn't allow constant parameters per line in the fragment shader. They are always
         # interpolated between vertices. Then, we must assign the parameter twice, once per vertex, with the same value
         vertexArray = []
@@ -737,7 +724,7 @@ class CNCCanvas(GLCanvas):
         maxX = maxY = maxZ = -999999
         minX = minY = minZ = 999999
         
-        for id, data in lines.items():
+        for id, data in linesDict.items():
             xyz = data[0]
             # We take xyz coords in pairs to create separate lines
             for i in range(len(xyz) - 1):
@@ -776,7 +763,7 @@ class CNCCanvas(GLCanvas):
                     minZ = min(min(minZ, xyz[i][2]), xyz[i+1][2])
 
         if updateModelDimensions:
-            if len(lines) == 0:
+            if len(linesDict) == 0:
                 self._modelCenter = vec3(0, 0, 0)
                 self._modelSize = 100
             else:
@@ -1243,7 +1230,7 @@ class CNCCanvas(GLCanvas):
                     return
 
             if self._vector:
-                self.delete(self._vector)
+                self.vectorDict = {}
             if self.action == ACTION_MOVE:
                 # Check if we clicked on a selected item
                 try:
@@ -1267,7 +1254,17 @@ class CNCCanvas(GLCanvas):
             else:
                 fill = RULER_COLOR
                 arrow = BOTH
-            self._vector = self.create_line(self.vectorLines,)
+            
+            xyz = self.canvas2WorldXY(vec2(event.x, event.y))
+            self._vector = self.create_line(self.vectorDict,
+                                            [[xyz.x, xyz.y, 0], [xyz.x, xyz.y, 0]],
+                                            self.rgb8(fill),
+                                            1.)
+            self.update_lines_buffer(self.vectorVBO, self.vectorDict)
+
+            # TODO: Project to XY or XZ or YZ, based on the view angle
+            # Or better, measure between existing points or lines
+            self._vx0, self._vy0, self._vz0 = xyz.x, xyz.y, 0
             """
             self._vector = self.create_line(
                 (i, j, i, j), fill=fill, arrow=arrow)
@@ -1301,8 +1298,11 @@ class CNCCanvas(GLCanvas):
 
         elif self.action == ACTION_PAN:
             self.pan(event)
+        
+        self.queueDraw()
 
     def isSelected(self, lineId, lineVertices):
+        pass # TODO:
 
 
     def midClick(self, event):
@@ -2503,140 +2503,30 @@ class CNCCanvas(GLCanvas):
         
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT) # type: ignore
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        glDisable(GL_DEPTH_TEST)
+        glEnable(GL_DEPTH_TEST)
+        glDepthFunc(GL_LEQUAL)
         glEnable(GL_BLEND)
         glEnable(GL_LINE_SMOOTH)
         glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
-        glEnable(GL_CULL_FACE)
-        glDepthFunc(GL_LEQUAL)
         
         # Draw background
-        glUseProgram(self.backgroundProgram)
-        glBindBuffer(GL_ARRAY_BUFFER, self.backgroundVBO)
-        glVertexAttribPointer(glGetAttribLocation(self.backgroundProgram, "xyz"), 3, GL_FLOAT, GL_FALSE, 6*4, c_void_p(0*4))
-        glVertexAttribPointer(glGetAttribLocation(self.backgroundProgram, "color"), 3, GL_FLOAT, GL_FALSE, 6*4, c_void_p(3*4))
-        glEnableVertexAttribArray(glGetAttribLocation(self.backgroundProgram, "xyz"))
-        glEnableVertexAttribArray(glGetAttribLocation(self.backgroundProgram, "color"))
-        glDrawArrays(GL_TRIANGLES, 0, 6)
-
+        self.drawBackground()
         # Ensure that the next items are drawn on top of this
         glClear(GL_DEPTH_BUFFER_BIT)
 
         # Draw Camera
         if self._showCamera:
-            glDisable(GL_CULL_FACE)
-            glUseProgram(self.ImageProgram)
-            glBindBuffer(GL_ARRAY_BUFFER, self.CameraVBO)
-            PARAMETERS_PER_VERTEX = 1
-            glVertexAttribPointer(glGetAttribLocation(self.ImageProgram, "index"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
-            glEnableVertexAttribArray(glGetAttribLocation(self.ImageProgram, "index"))
-
-            MVP = self.PMatrix * self.MVMatrix
-            mv_loc = glGetUniformLocation(program=self.ImageProgram, name="MVP")
-            glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
-
-            location_loc = glGetUniformLocation(program=self.ImageProgram, name="location")
-            glUniform2fv(location_loc, 1, value_ptr(self.cameraLocation))
-
-            # Set the uniform variable 'ourTexture' to texture unit 0
-            glActiveTexture(GL_TEXTURE0)
-            glBindTexture(GL_TEXTURE_2D, self.cameraTexture)
-            glUniform1i(glGetUniformLocation(self.ImageProgram, "ourTexture"), 0)
-
-            width_loc = glGetUniformLocation(program=self.ImageProgram, name="width")
-            glUniform1f(width_loc, len(self.cameraImage[0]))
-
-            height_loc = glGetUniformLocation(program=self.ImageProgram, name="height")
-            glUniform1f(height_loc, len(self.cameraImage))
-
-            canvasWidth_loc = glGetUniformLocation(program=self.ImageProgram, name="canvasWidth")
-            glUniform1f(canvasWidth_loc, self.winfo_width())
-
-            canvasHeight_loc = glGetUniformLocation(program=self.ImageProgram, name="canvasHeight")
-            glUniform1f(canvasHeight_loc, self.winfo_height())
-
-            # We get the zoom from the projection matrix
-            zoomx = self.PMatrix[0][0]
-            zoomy = self.PMatrix[1][1]
-            zoom_loc = glGetUniformLocation(program=self.ImageProgram, name="zoom")
-            glUniform2f(zoom_loc, zoomx, zoomy)
-            
-            cameraScale_loc = glGetUniformLocation(program=self.ImageProgram, name="cameraScale")
-            glUniform1f(cameraScale_loc, self.cameraScale)
-
-            glDrawArrays(GL_TRIANGLES, 0, 6)
-
+            self.drawCamera()
             # Ensure that the next items are drawn on top of this
             glClear(GL_DEPTH_BUFFER_BIT)
-        
-        # Draw Crosshair
-        if self._showCamera:
-            glUseProgram(self.CrossHairProgram)
-            glBindBuffer(GL_ARRAY_BUFFER, self.CrossHairVBO)
-            PARAMETERS_PER_VERTEX = 1
-            glVertexAttribPointer(glGetAttribLocation(self.CrossHairProgram, "index"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
-            glEnableVertexAttribArray(glGetAttribLocation(self.CrossHairProgram, "index"))
-
-            MVP = self.PMatrix * self.MVMatrix
-            mv_loc = glGetUniformLocation(program=self.CrossHairProgram, name="MVP")
-            glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
-
-            location_loc = glGetUniformLocation(program=self.CrossHairProgram, name="location")
-            glUniform2fv(location_loc, 1, value_ptr(self.cameraLocation))
-
-            width_loc = glGetUniformLocation(program=self.CrossHairProgram, name="width")
-            glUniform1f(width_loc, len(self.cameraImage[0]))
-
-            height_loc = glGetUniformLocation(program=self.CrossHairProgram, name="height")
-            glUniform1f(height_loc, len(self.cameraImage))
-
-            canvasWidth_loc = glGetUniformLocation(program=self.CrossHairProgram, name="canvasWidth")
-            glUniform1f(canvasWidth_loc, self.winfo_width())
-
-            canvasHeight_loc = glGetUniformLocation(program=self.CrossHairProgram, name="canvasHeight")
-            glUniform1f(canvasHeight_loc, self.winfo_height())
-
-            R_loc = glGetUniformLocation(program=self.CrossHairProgram, name="R")
-            glUniform1f(R_loc, self.cameraR)
-
-            # We get the zoom from the projection matrix
-            zoomx = self.PMatrix[0][0]
-            zoomy = self.PMatrix[1][1]
-            zoom_loc = glGetUniformLocation(program=self.CrossHairProgram, name="zoom")
-            glUniform2f(zoom_loc, zoomx, zoomy)
-
-            cameraScale_loc = glGetUniformLocation(program=self.CrossHairProgram, name="cameraScale")
-            glUniform1f(cameraScale_loc, self.cameraScale)
-
-            glLineWidth(1.5)
-            size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
-            glDrawArrays(GL_LINES, 0, size // PARAMETERS_PER_VERTEX)
-
+            # Draw Crosshair
+            self.drawCrossHair()
             # Ensure that the next items are drawn on top of this
             glClear(GL_DEPTH_BUFFER_BIT)
 
         # Draw grid
         if self.draw_grid:
-            glUseProgram(self.gridProgram)
-            glBindBuffer(GL_ARRAY_BUFFER, self.gridVBO)
-            PARAMETERS_PER_VERTEX = 4
-            glVertexAttribPointer(glGetAttribLocation(self.gridProgram, "xyz"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
-            glVertexAttribPointer(glGetAttribLocation(self.gridProgram, "position"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(3*4))
-            glEnableVertexAttribArray(glGetAttribLocation(self.gridProgram, "xyz"))
-            glEnableVertexAttribArray(glGetAttribLocation(self.gridProgram, "position"))
-            
-            MVP = self.PMatrix * self.MVMatrix
-            mv_loc = glGetUniformLocation(program=self.gridProgram, name="MVP")
-            glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
-            
-            zoom_loc = glGetUniformLocation(program=self.gridProgram, name="zoom")
-            glUniform1f(zoom_loc, self.zoom)
-            
-            glLineWidth(2)
-            glEnable(GL_LINE_SMOOTH)
-            glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
-            glDrawArrays(GL_LINES, 0, len(self.gridVertices) // PARAMETERS_PER_VERTEX)
-            glBindBuffer(GL_ARRAY_BUFFER, 0)
+            self.drawLines(self.gridVBO, 1)
         
         # Draw margins
         if self.draw_margin:
@@ -2648,7 +2538,7 @@ class CNCCanvas(GLCanvas):
         
         # Draw orient markers
         glClear(GL_DEPTH_BUFFER_BIT)
-        self.drawLines(self.orientVBO, 5)
+        self.drawLines(self.orientVBO, 3)
         
         # Draw path
         glClear(GL_DEPTH_BUFFER_BIT)
@@ -2693,7 +2583,101 @@ class CNCCanvas(GLCanvas):
         self.swap_buffers()
         
         self._drawRequested = False
-    
+
+    def drawBackground(self):
+        glUseProgram(self.backgroundProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, self.backgroundVBO)
+        glVertexAttribPointer(glGetAttribLocation(self.backgroundProgram, "xyz"), 3, GL_FLOAT, GL_FALSE, 6*4, c_void_p(0*4))
+        glVertexAttribPointer(glGetAttribLocation(self.backgroundProgram, "color"), 3, GL_FLOAT, GL_FALSE, 6*4, c_void_p(3*4))
+        glEnableVertexAttribArray(glGetAttribLocation(self.backgroundProgram, "xyz"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.backgroundProgram, "color"))
+        glDrawArrays(GL_TRIANGLES, 0, 6)
+
+    def drawCamera(self):
+        glDisable(GL_CULL_FACE)
+        glUseProgram(self.ImageProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, self.CameraVBO)
+        PARAMETERS_PER_VERTEX = 1
+        glVertexAttribPointer(glGetAttribLocation(self.ImageProgram, "index"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glEnableVertexAttribArray(glGetAttribLocation(self.ImageProgram, "index"))
+
+        MVP = self.PMatrix * self.MVMatrix
+        mv_loc = glGetUniformLocation(program=self.ImageProgram, name="MVP")
+        glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+
+        location_loc = glGetUniformLocation(program=self.ImageProgram, name="location")
+        glUniform2fv(location_loc, 1, value_ptr(self.cameraLocation))
+
+        # Set the uniform variable 'ourTexture' to texture unit 0
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, self.cameraTexture)
+        glUniform1i(glGetUniformLocation(self.ImageProgram, "ourTexture"), 0)
+
+        width_loc = glGetUniformLocation(program=self.ImageProgram, name="width")
+        glUniform1f(width_loc, len(self.cameraImage[0]))
+
+        height_loc = glGetUniformLocation(program=self.ImageProgram, name="height")
+        glUniform1f(height_loc, len(self.cameraImage))
+
+        canvasWidth_loc = glGetUniformLocation(program=self.ImageProgram, name="canvasWidth")
+        glUniform1f(canvasWidth_loc, self.winfo_width())
+
+        canvasHeight_loc = glGetUniformLocation(program=self.ImageProgram, name="canvasHeight")
+        glUniform1f(canvasHeight_loc, self.winfo_height())
+
+        # We get the zoom from the projection matrix
+        zoomx = self.PMatrix[0][0]
+        zoomy = self.PMatrix[1][1]
+        zoom_loc = glGetUniformLocation(program=self.ImageProgram, name="zoom")
+        glUniform2f(zoom_loc, zoomx, zoomy)
+        
+        cameraScale_loc = glGetUniformLocation(program=self.ImageProgram, name="cameraScale")
+        glUniform1f(cameraScale_loc, self.cameraScale)
+
+        glDrawArrays(GL_TRIANGLES, 0, 6)
+
+    def drawCrossHair(self):
+        glUseProgram(self.CrossHairProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, self.CrossHairVBO)
+        PARAMETERS_PER_VERTEX = 1
+        glVertexAttribPointer(glGetAttribLocation(self.CrossHairProgram, "index"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glEnableVertexAttribArray(glGetAttribLocation(self.CrossHairProgram, "index"))
+
+        MVP = self.PMatrix * self.MVMatrix
+        mv_loc = glGetUniformLocation(program=self.CrossHairProgram, name="MVP")
+        glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+
+        location_loc = glGetUniformLocation(program=self.CrossHairProgram, name="location")
+        glUniform2fv(location_loc, 1, value_ptr(self.cameraLocation))
+
+        width_loc = glGetUniformLocation(program=self.CrossHairProgram, name="width")
+        glUniform1f(width_loc, len(self.cameraImage[0]))
+
+        height_loc = glGetUniformLocation(program=self.CrossHairProgram, name="height")
+        glUniform1f(height_loc, len(self.cameraImage))
+
+        canvasWidth_loc = glGetUniformLocation(program=self.CrossHairProgram, name="canvasWidth")
+        glUniform1f(canvasWidth_loc, self.winfo_width())
+
+        canvasHeight_loc = glGetUniformLocation(program=self.CrossHairProgram, name="canvasHeight")
+        glUniform1f(canvasHeight_loc, self.winfo_height())
+
+        R_loc = glGetUniformLocation(program=self.CrossHairProgram, name="R")
+        glUniform1f(R_loc, self.cameraR)
+
+        # We get the zoom from the projection matrix
+        zoomx = self.PMatrix[0][0]
+        zoomy = self.PMatrix[1][1]
+        zoom_loc = glGetUniformLocation(program=self.CrossHairProgram, name="zoom")
+        glUniform2f(zoom_loc, zoomx, zoomy)
+
+        cameraScale_loc = glGetUniformLocation(program=self.CrossHairProgram, name="cameraScale")
+        glUniform1f(cameraScale_loc, self.cameraScale)
+
+        glLineWidth(1.5)
+        size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
+        glDrawArrays(GL_LINES, 0, size // PARAMETERS_PER_VERTEX)
+
     def drawSelectionRectangle(self):
         glDisable(GL_CULL_FACE)
         glUseProgram(self.SelectionRectProgram)
@@ -2914,7 +2898,7 @@ class CNCCanvas(GLCanvas):
         self.initPosition()
         
         self.createPaths()
-        self.pathVertices = self.update_lines_buffer(self.pathVBO, self.pathLines, True)
+        self.pathVertices = self.update_lines_buffer(self.pathVBO, self.pathDict, True)
         self.updateGrid()
         self.updateMargin()
         self.updateWorkArea()
@@ -2942,7 +2926,7 @@ class CNCCanvas(GLCanvas):
         
         # TODO: Anything apart from paths must be deleted...?
         #self.delete(ALL)
-        self.pathVertices = self.deleteLines(self.pathLines, self.pathVertices, self.pathVBO)
+        self.pathVertices = self.deleteLines(self.pathDict, self.pathVertices, self.pathVBO)
         self.deleteArrows(self.pathArrows, self.pathArrowsVBO)
 
         self.updateGantry(0, 0, 0)
@@ -3171,7 +3155,7 @@ class CNCCanvas(GLCanvas):
     # Draw coordinates grid
     # ----------------------------------------------------------------------
     def updateGrid(self):
-        vertices = []
+        gridLines = {}
         
         xmin = (CNC.vars["axmin"] // 10) * 10
         xmax = (CNC.vars["axmax"] // 10 + 1) * 10
@@ -3182,29 +3166,21 @@ class CNCCanvas(GLCanvas):
             int(CNC.vars["aymin"] // 10), int(CNC.vars["aymax"] // 10) + 2
         ):
             y = i * 10.0
-            vertices.extend([
-                xmin, y, 0, # Line starting point
-                0,          # Position. 0 for the starting point
-                xmax, y, 0, # Line end point
-                xmax - xmin # Position. Length for the end point
-            ])
+            self.create_line(gridLines,
+                             [[xmin, y, 0], [xmax, y, 0]],
+                             [127, 127, 127],
+                             0.25)
 
         for i in range(
             int(CNC.vars["axmin"] // 10), int(CNC.vars["axmax"] // 10) + 2
         ):
             x = i * 10.0
-            vertices.extend([
-                x, ymin, 0,
-                0,
-                x, ymax, 0,
-                ymax - ymin
-            ])
+            self.create_line(gridLines,
+                             [[x, ymin, 0], [x, ymax, 0]],
+                             [127, 127, 127],
+                             0.25)
         
-        self.gridVertices = numpy.array(vertices, dtype=numpy.float32)
-        
-        glBindBuffer(GL_ARRAY_BUFFER, self.gridVBO)
-        glBufferData(GL_ARRAY_BUFFER, self.gridVertices.nbytes, self.gridVertices, GL_STATIC_DRAW)
-        glBindBuffer(GL_ARRAY_BUFFER, 0)
+        self.update_lines_buffer(self.gridVBO, gridLines)
         
         self.queueDraw()
 
@@ -3212,7 +3188,7 @@ class CNCCanvas(GLCanvas):
     # Display orientation markers
     # ----------------------------------------------------------------------
     def drawOrient(self, event=None):
-        self.orientLines = {}
+        self.orientDict = {}
 
         # Draw orient markers
         if CNC.inch:
@@ -3225,26 +3201,26 @@ class CNCCanvas(GLCanvas):
             paths = []
             
             # Machine position (cross)
-            item = self.create_line(self.orientLines,
+            item = self.create_line(self.orientDict,
                 [(xm - w, ym, 0.0), (xm + w, ym, 0.0)],
                 self.rgb8('Green'),
                 1.)
             paths.append(item)
 
-            item = self.create_line(self.orientLines,
+            item = self.create_line(self.orientDict,
                 [(xm, ym - w, 0.0), (xm, ym + w, 0.0)],
                 self.rgb8('Green'),
                 1.)
             paths.append(item)
 
             # GCode position (cross)
-            item = self.create_line(self.orientLines,
+            item = self.create_line(self.orientDict,
                 [(x - w, y, 0.0), (x + w, y, 0.0)],
                 self.rgb8('Red'),
                 1.)
             paths.append(item)
 
-            item = self.create_line(self.orientLines,
+            item = self.create_line(self.orientDict,
                 [(x, y - w, 0.0), (x, y + w, 0.0)],
                 self.rgb8('Red'),
                 1.)
@@ -3253,7 +3229,7 @@ class CNCCanvas(GLCanvas):
             # Draw error if any
             try:
                 err = self.gcode.orient.errors[i]
-                item = self.create_oval(self.orientLines,
+                item = self.create_oval(self.orientDict,
                     (xm - err, ym - err, 0.0),
                     (xm + err, ym + err, 0.0),
                     self.rgb8('Red'),
@@ -3261,7 +3237,7 @@ class CNCCanvas(GLCanvas):
                 paths.append(item)
 
                 err = self.gcode.orient.errors[i]
-                item = self.create_oval(self.orientLines,
+                item = self.create_oval(self.orientDict,
                     (x - err, y - err, 0.0),
                     (x + err, y + err, 0.0),
                     self.rgb8('Red'),
@@ -3271,7 +3247,7 @@ class CNCCanvas(GLCanvas):
                 pass
 
             # Connecting line
-            item = self.create_line(self.orientLines,
+            item = self.create_line(self.orientDict,
                 [(xm, ym, 0.0), (x, y, 0.0)],
                 self.rgb8('LightBlue'),
                 0.5)
@@ -3289,7 +3265,7 @@ class CNCCanvas(GLCanvas):
                 pass
         """
         
-        self.update_lines_buffer(self.orientVBO, self.orientLines)
+        self.update_lines_buffer(self.orientVBO, self.orientDict)
         
         self.queueDraw()
 
@@ -3297,7 +3273,7 @@ class CNCCanvas(GLCanvas):
     # Display probe
     # ----------------------------------------------------------------------
     def drawProbe(self):
-        self.probeLines = {}
+        self.probeDict = {}
         #self.delete("Probe")
         if self._probe:
             #self.delete(self._probe)
@@ -3311,7 +3287,7 @@ class CNCCanvas(GLCanvas):
         for x in bmath.frange(probe.xmin, probe.xmax + 0.00001, probe.xstep()):
             xyz = [(x, probe.ymin, 0.0), (x, probe.ymax, 0.0)]
             item = self.create_line(
-                self.probeLines,
+                self.probeDict,
                 xyz,
                 self.rgb8('Yellow'),
                 1.)
@@ -3319,12 +3295,12 @@ class CNCCanvas(GLCanvas):
         for y in bmath.frange(probe.ymin, probe.ymax + 0.00001, probe.ystep()):
             xyz = [(probe.xmin, y, 0.0), (probe.xmax, y, 0.0)]
             item = self.create_line(
-                self.probeLines,
+                self.probeDict,
                 xyz,
                 self.rgb8('Yellow'),
                 1.)
         
-        self.update_lines_buffer(self.probeVBO, self.probeLines)
+        self.update_lines_buffer(self.probeVBO, self.probeDict)
 
         # Lines for debugging
         """
@@ -3335,22 +3311,23 @@ class CNCCanvas(GLCanvas):
         probe.add(725, 235, -2.2)
         """
 
-        # Draw probe points
+        # Draw probe points text
         # Normalize the map height to a 10% of the minimum map side
-        probeMaxZ = numpy.max(probe.matrix)
-        probeMinZ = numpy.min(probe.matrix)
-        probeMaxHeight = 0.1 * min(probe.xmax - probe.xmin, probe.ymax - probe.ymin)
-        ratioZ = probeMaxHeight / max(abs(probeMaxZ), abs(probeMinZ))
+        if probe.matrix:
+            probeMaxZ = numpy.max(probe.matrix)
+            probeMinZ = numpy.min(probe.matrix)
+            probeMaxHeight = 0.1 * min(probe.xmax - probe.xmin, probe.ymax - probe.ymin)
+            ratioZ = probeMaxHeight / max(abs(probeMaxZ), abs(probeMinZ))
 
-        self.probeText = {}
-        for i, location in enumerate(probe.points):
-            item = self.create_text(
-                self.probeText,
-                vec3(location[0], location[1], location[2] * ratioZ),
-                f"{probe.points[i][2]:.{CNC.digits}f}",
-                self.rgb8('Yellow'))
+            self.probeText = {}
+            for i, location in enumerate(probe.points):
+                item = self.create_text(
+                    self.probeText,
+                    vec3(location[0], location[1], location[2] * ratioZ),
+                    f"{probe.points[i][2]:.{CNC.digits}f}",
+                    self.rgb8('Yellow'))
 
-        self.update_text_buffer(self.ProbeTextVBO, self.probeText)
+            self.update_text_buffer(self.ProbeTextVBO, self.probeText)
 
         # Draw image map if numpy exists
         if (numpy is not None and probe.matrix):
@@ -3611,7 +3588,7 @@ class CNCCanvas(GLCanvas):
             if self.cnc.gcode == 0:
                 if self.draw_rapid:
                     return self.create_line(
-                        self.pathLines,
+                        self.pathDict,
                         xyz,
                         (255, 0, 0),
                         0.5,
@@ -3619,7 +3596,7 @@ class CNCCanvas(GLCanvas):
                 
             elif self.draw_paths:
                 return self.create_line(
-                    self.pathLines,
+                    self.pathDict,
                     xyz,
                     self.rgb8(fill),
                     1,
