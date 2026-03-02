@@ -1,5 +1,9 @@
 This is an attempt to port bCNC Canvas to OpenGL, so that it has a true 3d viewport.
 
+<img width="1920" height="1051" alt="image" src="https://github.com/user-attachments/assets/e78b6c0b-b1d8-42a6-ba0c-30603b34796d" />
+
+
+
 NOTE: Currently, it is almost fully functional, but is still being tested!!! The code of the CNC Canvas was significantly modified, so it can have bugs.
 
 The idea is to try to make the minimum modifications to the original code. In fact, except for a couple of lines in other files, only CNCCanvas.py is being modified. Additional files such as opengl shaders are added.
@@ -28,6 +32,10 @@ Other differences with the original:
   - The probe map is now shown as a 3d tesselated surface, with interpolated colors.
 
 In order to make the code compatible with the Raspberry Pi, GLSL version 1.0 was used for the OpenGL shaders. It is quite limiting, and made the code more complex than if a newer version was used.
+
+<img width="1322" height="811" alt="image" src="https://github.com/user-attachments/assets/0dfaddef-e4f8-422d-95cd-004a4e4cfa1b" />
+
+
 
 bCNC
 ====
