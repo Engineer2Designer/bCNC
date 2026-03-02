@@ -129,7 +129,7 @@ SELECT2_COLOR = "DarkCyan"
 PROCESS_COLOR = "Green"
 
 MOVE_COLOR = "DarkCyan"
-RULER_COLOR = "Green"
+RULER_COLOR = "White"
 PROBE_TEXT_COLOR = "Green"
 
 INFO_COLOR = "Gold"
@@ -247,7 +247,6 @@ class CNCCanvas(GLCanvas):
         self.bind("<Key>", self.handleKey)
 
         self.bind("<Control-Key-S>", self.cameraSave)
-        self.bind("<Control-Key-t>", self.__test)
 
         self.bind("<Control-Key-equal>", self.menuZoomIn)
         self.bind("<Control-Key-minus>", self.menuZoomOut)
@@ -302,9 +301,6 @@ class CNCCanvas(GLCanvas):
         self._wx = self._wy = self._wz = 0.0  # work position
         self._dx = self._dy = self._dz = 0.0  # work-machine position
 
-        self._vx0 = self._vy0 = self._vz0 = 0  # vector move coordinates
-        self._vx1 = self._vy1 = self._vz1 = 0  # vector move coordinates
-
         self._orientSelected = None
 
         # OPENGL vars
@@ -330,6 +326,7 @@ class CNCCanvas(GLCanvas):
         
         self.pathArrows = {}
         self.infoArrows = {}
+        self.vectorArrowsDict = {}
         
         self._modelCenter = vec3(0, 0, 0)
         self._modelSize = 100.0
@@ -582,6 +579,7 @@ class CNCCanvas(GLCanvas):
         # Create a Vertex Buffer Object (VBO)
         self.pathArrowsVBO = glGenBuffers(1)
         self.infoArrowsVBO = glGenBuffers(1)
+        self.vectorArrowsVBO = glGenBuffers(1)
         
         # ----- CROSSHAIR PROGRAM ------
         # Program to draw the Camera Crosshair
@@ -775,7 +773,6 @@ class CNCCanvas(GLCanvas):
                 ])
                 
                 if updateModelDimensions:
-                    # TODO: Optimize this
                     maxX = max(max(maxX, xyz[i][0]), xyz[i+1][0])
                     maxY = max(max(maxY, xyz[i][1]), xyz[i+1][1])
                     maxZ = max(max(maxZ, xyz[i][2]), xyz[i+1][2])
@@ -1022,25 +1019,10 @@ class CNCCanvas(GLCanvas):
 
     # ----------------------------------------------------------------------
     def setMouseStatus(self, event):
-        data = "%.4f %.4f %.4f" % self.canvas2xyz(
-            event.x, event.y
-        )
-        self.event_generate("<<Coords>>", data=data)
-
-    # ----------------------------------------------------------------------
-    # Update scrollbars
-    # ----------------------------------------------------------------------
-    def _updateScrollBars(self):
-        """Update scroll region for new size"""
-        bb = self.bbox("all")
-        if bb is None:
-            return
-        x1, y1, x2, y2 = bb
-        dx = x2 - x1
-        dy = y2 - y1
-        # make it 3 times bigger in each dimension
-        # so when we zoom in/out we don't touch the borders
-        self.configure(scrollregion=(x1 - dx, y1 - dy, x2 + dx, y2 + dy))
+        xy_w = self.canvas2WorldXY(vec2(event.x, event.y), 0)
+        if xy_w is not None:
+            data = "%.4f %.4f %.4f" % (xy_w.x, xy_w.y, 0)
+            self.event_generate("<<Coords>>", data=data)
 
     # ----------------------------------------------------------------------
     def handleKey(self, event):
@@ -1082,6 +1064,11 @@ class CNCCanvas(GLCanvas):
 
         if self.action == ACTION_SELECT:
             self._snapPoint = None
+        
+        # Erase the RULER / MOVE arrow
+        self._vector = None
+
+        self.queueDraw()
 
     # ----------------------------------------------------------------------
     def actionCancel(self, event=None):
@@ -1104,6 +1091,7 @@ class CNCCanvas(GLCanvas):
     # ----------------------------------------------------------------------
     def setActionOrigin(self, event=None):
         self.setAction(ACTION_ORIGIN)
+        self._mouseAction = ACTION_ORIGIN
         self.status(_("Click to set the origin (zero)"))
 
     # ----------------------------------------------------------------------
@@ -1114,13 +1102,11 @@ class CNCCanvas(GLCanvas):
     # ----------------------------------------------------------------------
     def setActionGantry(self, event=None):
         self.setAction(ACTION_GANTRY)
-        # TODO: #self.config(background="seashell")
         self.status(_("Move CNC gantry to mouse location"))
 
     # ----------------------------------------------------------------------
     def setActionWPOS(self, event=None):
         self.setAction(ACTION_WPOS)
-        # TODO: # self.config(background="ivory")
         self.status(
             _("Set mouse location as current machine position (X/Y only)"))
 
@@ -1160,16 +1146,10 @@ class CNCCanvas(GLCanvas):
             return -0.5 * (u / S60 + v / C60), -0.5 * (u / S60 - v / C60), None
 
     # ----------------------------------------------------------------------
-    # Image (pixel) coordinates to machine
-    # ----------------------------------------------------------------------
-    def image2Machine(self, x, y):
-        return self.canvas2Machine(self.canvasx(x), self.canvasy(y))
-
-    # ----------------------------------------------------------------------
     # Move gantry to mouse location
     # ----------------------------------------------------------------------
     def actionGantry(self, x, y):
-        xy_w = self.canvas2WorldXY(vec2(x, y)) # self.image2Machine(x, y)
+        xy_w = self.canvas2WorldXY(vec2(x, y))
         
         if xy_w is not None:
             self.app.goto(xy_w.x, xy_w.y, 0)
@@ -1183,7 +1163,7 @@ class CNCCanvas(GLCanvas):
     # Set the work coordinates to mouse location
     # ----------------------------------------------------------------------
     def actionWPOS(self, x, y):
-        xy_w = self.canvas2WorldXY(vec2(x, y)) # self.image2Machine(x, y)
+        xy_w = self.canvas2WorldXY(vec2(x, y))
         
         if xy_w is not None:
             self.app.mcontrol._wcsSet(xy_w.x, xy_w.y, 0)
@@ -1236,35 +1216,10 @@ class CNCCanvas(GLCanvas):
         elif self.action in (ACTION_MOVE, ACTION_RULER):
             i = event.x
             j = event.y
-            if self.action == ACTION_RULER and self._vector is not None:
-                pass
-                # TODO: Implement
-                # Check if we hit the existing ruler
-                start, end, center = self.get_ends_and_center(self.vectorDict, self._vector)
 
-                start_c = self.world2Canvas(start)
-                end_c = self.world2Canvas(end)
+            self.vectorDict = {}
+            self.vectorArrowsDict = {}
 
-                if abs(start_c.x - i) <= CLOSE_DISTANCE and abs(
-                    start_c.y - j <= CLOSE_DISTANCE
-                ):
-                    # swap coordinates
-                    coords[0], coords[2] = coords[2], coords[0]
-                    coords[1], coords[3] = coords[3], coords[1]
-                    self.coords(self._vector, *coords)
-                    self._vx0, self._vy0, self._vz0 = self.canvas2xyz(
-                        coords[0], coords[1]
-                    )
-                    self._mouseAction = self.action
-                    return
-                elif abs(end_c.x - i) <= CLOSE_DISTANCE and abs(
-                    end_c.y - j <= CLOSE_DISTANCE
-                ):
-                    self._mouseAction = self.action
-                    return
-
-            if self._vector:
-                self.vectorDict = {}
             if self.action == ACTION_MOVE:
                 # Check if we clicked on a selected item
                 try:
@@ -1280,36 +1235,46 @@ class CNCCanvas(GLCanvas):
                     else:
                         self._mouseAction = ACTION_SELECT_SINGLE
                         return
-                    fill = MOVE_COLOR
+                    # fill = MOVE_COLOR
+                    fill = 'White'
                     arrow = LAST
                 except Exception:
                     self._mouseAction = ACTION_SELECT_SINGLE
                     return
             else:
-                fill = RULER_COLOR
+                # fill = RULER_COLOR
+                fill = 'White'
                 arrow = BOTH
             
-            xyz = self.snapPoint(event.x, event.y)
-            xyz = self.canvas2WorldXY(vec2(event.x, event.y))
+            self._snapPoint = self.snapPoint(vec2(event.x, event.y))
 
-            if xyz is None:
-                return # TODO: Do we neet to change the current action?
-            
-            self._vector = self.create_line(self.vectorDict,
-                                            [[xyz.x, xyz.y, 0], [xyz.x, xyz.y, 0]],
-                                            self.rgb8(fill),
-                                            1.)
-            self.update_lines_buffer(self.vectorVBO, self.vectorDict)
+            if self._snapPoint is None:
+                start = self.canvas2WorldXY(vec2(event.x, event.y), 20)
+                start = vec3(start.x, start.y, 0)
+            else:
+                start = self._snapPoint
 
-            # TODO: Project to XY or XZ or YZ, based on the view angle
-            # Or better, measure between existing points or lines
-            self._vx0, self._vy0, self._vz0 = xyz.x, xyz.y, 0
-            """
-            self._vector = self.create_line(
-                (i, j, i, j), fill=fill, arrow=arrow)
-            self._vx0, self._vy0, self._vz0 = self.canvas2xyz(i, j)
-            """
-            self._mouseAction = self.action
+            if start is not None:
+                if self.action == ACTION_MOVE:
+                    self._moveFrom = start
+                
+                self._vector = self.create_line(self.vectorDict,
+                                                [[start.x, start.y, start.z], [start.x, start.y, start.z]],
+                                                self.rgb8(fill),
+                                                1.)
+                vectorVertices = self.update_lines_buffer(self.vectorVBO, self.vectorDict)
+
+                # Draw arrows
+                self.set_arrow(self.vectorArrowsDict,
+                                self.vectorArrowsVBO,
+                                vectorVertices,
+                                self._vector,
+                                arrow,
+                                10,
+                                10)
+                
+                self._lastEnd = start
+                self._mouseAction = self.action            
 
         # Move gantry to position
         elif self.action == ACTION_GANTRY:
@@ -1325,7 +1290,13 @@ class CNCCanvas(GLCanvas):
 
         # Set coordinate origin
         elif self.action == ACTION_ORIGIN:
-            xy_w = self.canvas2WorldXY(vec2(event.x, event.y))
+            self._snapPoint = self.snapPoint(vec2(event.x, event.y))
+
+            if self._snapPoint is None:
+                xy_w = self.canvas2WorldXY(vec2(event.x, event.y))
+            else:
+                xy_w = self._snapPoint
+                
             if xy_w is not None:
                 self.app.insertCommand(_("origin {:g} {:g} {:g}").format(xy_w.x, xy_w.y, 0),
                                    True)
@@ -1340,8 +1311,16 @@ class CNCCanvas(GLCanvas):
         
         self.queueDraw()
 
-    def isSelected(self, lineId, lineVertices):
-        pass # TODO:
+    def isSelected(self, lineId, lineVertices) -> bool:
+        lines16 = numpy.reshape(lineVertices, (-1, 16))
+        line16 = lines16[lines16[:, 0] == lineId]
+
+        if len(line16) == 0:
+            return False
+        
+        # Flags at item 7 of the line data
+        return (int(line16[0][7]) & FLAG_SELECTED) == FLAG_SELECTED
+
 
 
     def midClick(self, event):
@@ -1392,34 +1371,60 @@ class CNCCanvas(GLCanvas):
                 self._mouseAction = ACTION_SELECT_AREA
                 self.updateSelectionRect(self._x, self._y, event.x, event.y)
 
-        elif self._mouseAction in (ACTION_MOVE, ACTION_RULER):
-            coords = self.coords(self._vector)
-            i = self.canvasx(event.x)
-            j = self.canvasy(event.y)
-            coords[-2] = i
-            coords[-1] = j
-            self.coords(self._vector, *coords)
-            if self._mouseAction == ACTION_MOVE:
-                self.move("sel", event.x - self._xp, event.y - self._yp)
-                self.move("sel2", event.x - self._xp, event.y - self._yp)
-                self.move("sel3", event.x - self._xp, event.y - self._yp)
-                self.move("sel4", event.x - self._xp, event.y - self._yp)
-                self._xp = event.x
-                self._yp = event.y
+        elif self._mouseAction == ACTION_MOVE or self._mouseAction == ACTION_RULER:
+            if self._vector:
+                # Calculate the end snap point
+                if self._mouseAction == ACTION_MOVE:
+                    self._snapPoint = self.snapPoint(vec2(event.x, event.y), True)
+                else:
+                    self._snapPoint = self.snapPoint(vec2(event.x, event.y))
 
-            self._vx1, self._vy1, self._vz1 = self.canvas2xyz(i, j)
-            dx = self._vx1 - self._vx0
-            dy = self._vy1 - self._vy0
-            dz = self._vz1 - self._vz0
-            self.status(
-                _("dx={:g}  dy={:g}  dz={:g}  length={:g}  angle={:g}").format(
-                    dx,
-                    dy,
-                    dz,
-                    math.sqrt(dx**2 + dy**2 + dz**2),
-                    math.degrees(math.atan2(dy, dx)),
+                # Draw the line to the current cursor point or to the snap point, if found
+                if self._snapPoint is None:
+                    end = self.canvas2WorldXY(vec2(event.x, event.y), 0)
+                    end = vec3(end.x, end.y, 0)
+                else:
+                    end = self._snapPoint
+
+                # Change the _vector line end and update the corresponding opengl buffer
+                self.vectorDict[self._vector][0][1] = [end.x, end.y, end.z]
+                vectorVertices = self.update_lines_buffer(self.vectorVBO, self.vectorDict)
+
+                # Draw arrows
+                if self._mouseAction == ACTION_MOVE:
+                    arrow = 'last'
+                else:
+                    arrow = 'both'
+
+                self.set_arrow(self.vectorArrowsDict,
+                               self.vectorArrowsVBO,
+                               vectorVertices,
+                               self._vector,
+                               arrow,
+                               10,
+                               10)
+
+                if self._mouseAction == ACTION_MOVE:
+                    selectedIds = self.getSelection(self.pathVertices)
+
+                    self.move(self.pathVertices, selectedIds, end - self._lastEnd, self.pathVBO)
+
+                start = vec3(self.vectorDict[self._vector][0][0])
+                v12 = end - start
+
+                self.status(
+                _("dx={:g}  dy={:g}  dz={:g}  length={:g}  angleXY={:g}").format(
+                    v12.x,
+                    v12.y,
+                    v12.z,
+                    distance(start, end),
+                    math.degrees(math.atan2(v12.y, v12.x)),
                 )
             )
+                
+                self._lastEnd = end
+
+                self.queueDraw()
 
         elif self._mouseAction == ACTION_PAN:
             self.pan(event)
@@ -1428,6 +1433,19 @@ class CNCCanvas(GLCanvas):
 
         self.queueDraw()
     
+    def move(self, linesVertices, lineIds, translation : vec3, bufferToUpdate = None):
+        lines16 = numpy.reshape(linesVertices, (-1, 16))
+        mask = numpy.isin(lines16[:, 0], lineIds)
+
+        lines16[mask, 1:4] += translation
+        lines16[mask, 9:12] += translation
+
+        if bufferToUpdate:
+            glBindBuffer(GL_ARRAY_BUFFER, bufferToUpdate)
+            glBufferSubData(GL_ARRAY_BUFFER, 0, linesVertices.nbytes, linesVertices)
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
+            self.queueDraw()
+
     def find_overlapping(self, x1, y1, x2, y2, lines):
         # Unit coordinates of the selection area boundaries
         xy1 = self.canvas2Unit(vec2(x1, y1))
@@ -1528,7 +1546,7 @@ class CNCCanvas(GLCanvas):
         
         return numpy.unique(lines_16[mask]).tolist() 
     
-    def find_closest(self, x, y, lines, tolerance, returnIndex = False):
+    def find_closest(self, x, y, lines, tolerance, returnIndex = False, excludeSelected = False):
         # Unit coordinates of the selection area boundaries
         xy = self.canvas2Unit(vec2(x, y))
 
@@ -1583,6 +1601,11 @@ class CNCCanvas(GLCanvas):
         u2_min = numpy.min(u2, axis=1)
 
         intersects = (u1_max <= u2_min) & ~any_outside
+
+        if excludeSelected:
+            lines16 = numpy.reshape(lines, (-1, 16))
+            selection_mask = (lines16[:, 7].astype(int) & FLAG_SELECTED) == FLAG_SELECTED
+            intersects = intersects & ~selection_mask
         
         # TODO: Return the closest one, not the first in the list...
 
@@ -1592,9 +1615,9 @@ class CNCCanvas(GLCanvas):
             selectedIndices = indices[intersects].tolist()
 
             if len(selectedIndices) == 0:
-                return None
+                return []
             else:
-                return selectedIndices[0]
+                return [selectedIndices[0]]
             
         else:
             # Get the ids of the overlapped lines (id is the 1st parameter of the lines array)
@@ -1667,6 +1690,7 @@ class CNCCanvas(GLCanvas):
                     try:
                         items.append(self._items[i])
                     except KeyError:
+                        #  TODO: Implement
                         tags = self.gettags(i)
                         if "Orient" in tags:
                             self.selectMarker(i)
@@ -1683,14 +1707,15 @@ class CNCCanvas(GLCanvas):
             self.queueDraw()
 
         elif self._mouseAction == ACTION_MOVE:
-            i = self.canvasx(event.x)
-            j = self.canvasy(event.y)
-            self._vx1, self._vy1, self._vz1 = self.canvas2xyz(i, j)
-            dx = self._vx1 - self._vx0
-            dy = self._vy1 - self._vy0
-            dz = self._vz1 - self._vz0
-            self.status(_("Move by {:g}, {:g}, {:g}").format(dx, dy, dz))
-            self.app.insertCommand(("move %g %g %g") % (dx, dy, dz), True)
+            moveFrom = vec3(self.vectorDict[self._vector][0][0])
+            moveTo = self._lastEnd
+            translation = moveTo - moveFrom
+
+            self.status(_("Move by {:g}, {:g}, {:g}").format(translation.x, translation.y, translation.z))
+            self.app.insertCommand(("move %g %g %g") % (translation.x, translation.y, translation.z), True)
+        
+        elif self._mouseAction == ACTION_RULER:
+            self._snapPoint = None
 
         elif self._mouseAction == ACTION_PAN:
             self.midRelease(event)
@@ -1709,15 +1734,18 @@ class CNCCanvas(GLCanvas):
 
             self.queueDraw()
 
-        self.setMouseStatus(event)
+        elif self.action == ACTION_MOVE or self.action == ACTION_RULER:
+            self._snapPoint = self.snapPoint(vec2(event.x, event.y))
 
-    # -----------------------------------------------------------------------
-    # Testing routine
-    # -----------------------------------------------------------------------
-    def __test(self, event):
-        i = self.canvasx(event.x)
-        j = self.canvasy(event.y)
-        x, y, z = self.canvas2xyz(i, j)
+            self.queueDraw()
+        
+        elif self._mouseAction == ACTION_ORIGIN:
+            self._snapPoint = self.snapPoint(vec2(event.x, event.y))
+
+            self.queueDraw()
+
+
+        self.setMouseStatus(event)
 
     def get_ends_and_center(self, lines, id):
         # lines is an array with lines vertex data as self.pathLines
@@ -1728,7 +1756,10 @@ class CNCCanvas(GLCanvas):
         # Filter the lines with id. If there is more than one, it is an arc composed by multiple lines
         line16 = lines16[lines16[:, 0] == id]
 
-        if len(line16) == 1: # Just one row. We picked on a line
+        if len(line16) == 0:
+            return None, None, None
+        
+        elif len(line16) == 1: # Just one row. We picked on a line
             return vec3(line16[0, 1:4]), vec3(line16[0, 9:12]), None
         
         else: # Multiple rows. We picked on an arc. We return the first point of the first line and the last point of the last line
@@ -1762,19 +1793,22 @@ class CNCCanvas(GLCanvas):
     # ----------------------------------------------------------------------
     # Snap to the closest point if any
     # ----------------------------------------------------------------------
-    def snapPoint(self, clickPoint: vec2) -> vec3 | None:
+    def snapPoint(self, clickPoint: vec2, excludeSelected = False) -> vec3 | None:
         """
         When clicking on the canvas at point clickPoint, return the world coordinates of a close path point, or none
         """
         snapPoint = None
 
-        item = self.find_closest(clickPoint.x, clickPoint.y, self.pathVertices, CLOSE_DISTANCE)
+        item = self.find_closest(clickPoint.x, clickPoint.y, self.pathVertices, CLOSE_DISTANCE, excludeSelected=excludeSelected)
 
         if len(item) == 0:
             return None
         
         # Get the ends of the closest line, in canvas coordinates
         start, end, center = self.get_ends_and_center(self.pathVertices, item)
+
+        if start is None or end is None:
+            return None
 
         start_c = self.world2Canvas(start)
         end_c = self.world2Canvas(end)
@@ -1790,32 +1824,6 @@ class CNCCanvas(GLCanvas):
             return center
         else:
             return None
-            
-    # ----------------------------------------------------------------------
-    # Get margins of selected items
-    # ----------------------------------------------------------------------
-    def getMargins(self):
-        bbox = self.bbox("sel")
-        if not bbox:
-            return None
-        x1, y1, x2, y2 = bbox
-        dx = (x2 - x1 - 1) / self.zoom
-        dy = (y2 - y1 - 1) / self.zoom
-        return dx, dy
-
-    # ----------------------------------------------------------------------
-    def xview(self, *args):
-        ret = Canvas.xview(self, *args)
-        if args:
-            self.cameraPosition()
-        return ret
-
-    # ----------------------------------------------------------------------
-    def yview(self, *args):
-        ret = Canvas.yview(self, *args)
-        if args:
-            self.cameraPosition()
-        return ret
 
     # ----------------------------------------------------------------------
     def configureEvent(self, event):
@@ -1923,10 +1931,10 @@ class CNCCanvas(GLCanvas):
         # If there was no pan (just mid-click), and the user clicked on a path, 
         # change the rotation center to the closest point of that line to the point where the user clicked
         if self._mouseAction != ACTION_PAN:
-            lineIndex = self.find_closest(self._x, self._y, self.pathVertices, CLOSE_DISTANCE, True)
+            lineIndex = self.find_closest(self._x, self._y, self.pathVertices, CLOSE_DISTANCE, returnIndex=True)
             
             if lineIndex is not None:
-                line = self.pathVertices.reshape((-1, 16))[int(lineIndex)]
+                line = self.pathVertices.reshape((-1, 16))[int(lineIndex[0])]
                 lineStart = vec3(line[1:4])
                 lineEnd = vec3(line[9:12])
 
@@ -2086,28 +2094,6 @@ class CNCCanvas(GLCanvas):
         self.cameraPosition()
 
         self.queueDraw()
-        
-        # TODO: Implement the rest
-        return
-
-        x0 = self.canvasx(0)
-        y0 = self.canvasy(0)
-
-        # Update last insert
-        if self._lastGantry:
-            self.updateGantry(*self.plotCoords([self._lastGantry])[0])
-        else:
-            self.updateGantry(0, 0)
-
-        # Drag to new location to center viewport
-        self.scan_mark(0, 0)
-        self.scan_dragto(int(round(dx - x0)), int(round(dy - y0)), 1)
-
-        # Resize probe image if any
-        if self._probe:
-            self._projectProbeImage()
-            self.itemconfig(self._probe, image=self._probeTkImage)
-        self.cameraUpdate()
 
     # ----------------------------------------------------------------------
     # Return selected objects bounding box
@@ -2272,13 +2258,19 @@ class CNCCanvas(GLCanvas):
                 
         self.updateMargin()
     
-    def setFlags(self, linesArray, flagsToModify, linesAndFlags, bufferToUpdate = None):
+    def getSelection(self, linesVertices):
+        lines16 = numpy.reshape(linesVertices, (-1, 16))
+        selection = lines16[(lines16[:, 7].astype(int) & FLAG_SELECTED) == FLAG_SELECTED]
+        return numpy.unique(selection[:, 0]).tolist()
+
+
+    def setFlags(self, linesVertices, flagsToModify, linesAndFlags, bufferToUpdate = None):
         # linesAndTags must be an array of arrays (nx2)
         # The first item of each array is the line number, and the second item the value with the Tags to be activated
         selections = numpy.array(linesAndFlags, dtype=numpy.float32).reshape((-1, 2))
         lookup = dict(selections)
         
-        linesArray16 = linesArray.reshape((-1, 16))
+        linesArray16 = linesVertices.reshape((-1, 16))
         mask = numpy.isin(linesArray16[:, 0], selections[:, 0])
         
         matched_keys = linesArray16[mask, 0]
@@ -2294,7 +2286,7 @@ class CNCCanvas(GLCanvas):
         
             if bufferToUpdate:
                 glBindBuffer(GL_ARRAY_BUFFER, bufferToUpdate)
-                glBufferSubData(GL_ARRAY_BUFFER, 0, linesArray.nbytes, linesArray)
+                glBufferSubData(GL_ARRAY_BUFFER, 0, linesVertices.nbytes, linesVertices)
                 glBindBuffer(GL_ARRAY_BUFFER, 0)
                 self.queueDraw()
 
@@ -2329,28 +2321,36 @@ class CNCCanvas(GLCanvas):
             if item in paths:
                 self._orientSelected = i
                 for j in paths:
-                    self.itemconfig(j, width=2)
+                    self.orientDict[j][3] = FLAG_ENABLED | FLAG_SELECTED
+                
+                self.update_lines_buffer(self.orientVBO, self.orientDict)
+
                 self.event_generate("<<OrientSelect>>", data=i)
                 return
+            
         self._orientSelected = None
 
     # ----------------------------------------------------------------------
     # Highlight marker that was selected
     # ----------------------------------------------------------------------
     def orientChange(self, marker):
-        # TODO: implement
-        #self.itemconfig("Orient", width=1)
+        for id in self.orientDict:
+            self.orientDict[id][3] = FLAG_ENABLED
+
         if marker >= 0:
             self._orientSelected = marker
             try:
                 for i in self.gcode.orient.paths[self._orientSelected]:
-                    # TODO: Implement
-                    pass
-                    # self.itemconfig(i, width=2)
+                    self.orientDict[i][3] = FLAG_ENABLED | FLAG_SELECTED
+
             except IndexError:
                 self.drawOrient()
         else:
             self._orientSelected = None
+        
+        self.update_lines_buffer(self.orientVBO, self.orientDict)
+
+        self.queueDraw()
 
     # ----------------------------------------------------------------------
     # Display graphical information on selected blocks
@@ -2641,6 +2641,11 @@ class CNCCanvas(GLCanvas):
         # Draw selection rectangle
         if self._mouseAction == ACTION_SELECT_AREA:
             self.drawSelectionRectangle()
+        
+        # Draw ruler
+        if self._vector:
+            self.drawLines(self.vectorVBO, 2)
+            self.drawArrows(self.vectorArrowsVBO)
 
         glUseProgram(0)
         
@@ -2990,20 +2995,11 @@ class CNCCanvas(GLCanvas):
         
         self.createPaths()
         self.pathVertices = self.update_lines_buffer(self.pathVBO, self.pathDict, True)
+
         self.updateGrid()
         self.updateMargin()
         self.updateWorkArea()
 
-        """ self.__tzoom = 1.0
-        xyz = self.canvas2xyz(
-            self.canvasx(self.winfo_width() / 2),
-            self.canvasy(self.winfo_height() / 2)
-        )
-
-        if view is not None:
-            self.view = view
-
-        """
         self.drawProbe()
 
         self.drawOrient()
@@ -3173,50 +3169,6 @@ class CNCCanvas(GLCanvas):
         self.queueDraw()
 
     # ----------------------------------------------------------------------
-    # Change rectangle coordinates
-    # ----------------------------------------------------------------------
-    def _rectCoords(self, rect, xmin, ymin, xmax, ymax, z=0.0):
-        self.coords(
-            rect,
-            tkinter._flatten(
-                self.plotCoords(
-                    [
-                        (xmin, ymin, z),
-                        (xmax, ymin, z),
-                        (xmax, ymax, z),
-                        (xmin, ymax, z),
-                        (xmin, ymin, z),
-                    ]
-                )
-            ),
-        )
-
-    # ----------------------------------------------------------------------
-    # Draw a 3D path
-    # ----------------------------------------------------------------------
-    def _drawPath(self, path, z=0.0, **kwargs):
-        xyz = []
-        for segment in path:
-            xyz.append((segment.A[0], segment.A[1], z))
-            xyz.append((segment.B[0], segment.B[1], z))
-        rect = (self.create_line(self.plotCoords(xyz), **kwargs),)
-        return rect
-
-    # ----------------------------------------------------------------------
-    # Draw a 3D rectangle
-    # ----------------------------------------------------------------------
-    def _drawRect(self, xmin, ymin, xmax, ymax, z=0.0, **kwargs):
-        xyz = [
-            (xmin, ymin, z),
-            (xmax, ymin, z),
-            (xmax, ymax, z),
-            (xmin, ymax, z),
-            (xmin, ymin, z),
-        ]
-        rect = (self.create_line(self.plotCoords(xyz), **kwargs),)
-        return rect
-
-    # ----------------------------------------------------------------------
     # Draw a workspace rectangle
     # ----------------------------------------------------------------------
     def updateWorkArea(self):
@@ -3346,15 +3298,13 @@ class CNCCanvas(GLCanvas):
 
             self.gcode.orient.addPath(paths)
 
-        # TODO: Implement this
-        """
         if self._orientSelected is not None:
             try:
                 for item in self.gcode.orient.paths[self._orientSelected]:
-                    self.itemconfig(item, width=2)
+                    self.orientDict[item][3] = FLAG_ENABLED | FLAG_SELECTED
+
             except (IndexError, TclError):
                 pass
-        """
         
         self.update_lines_buffer(self.orientVBO, self.orientDict)
         
@@ -3365,9 +3315,7 @@ class CNCCanvas(GLCanvas):
     # ----------------------------------------------------------------------
     def drawProbe(self):
         self.probeDict = {}
-        #self.delete("Probe")
         if self._probe:
-            #self.delete(self._probe)
             self._probe = None
         if not self.draw_probe:
             self.queueDraw()
@@ -3516,80 +3464,12 @@ class CNCCanvas(GLCanvas):
 
         return probeMapVertices
 
-
-    # ----------------------------------------------------------------------
-    # Create the tkimage for the current projection
-    # ----------------------------------------------------------------------
-    def _projectProbeImage(self):
-        probe = self.gcode.probe
-        size = (
-            int((probe.xmax - probe.xmin + probe._xstep) * self.zoom),
-            int((probe.ymax - probe.ymin + probe._ystep) * self.zoom),
-        )
-        marginx = int(probe._xstep / 2.0 * self.zoom)
-        marginy = int(probe._ystep / 2.0 * self.zoom)
-        crop = (marginx, marginy, size[0] - marginx, size[1] - marginy)
-
-        image = self._probeImage.resize((size), resample=RESAMPLE).crop(crop)
-
-        if self.view in (VIEW_ISO1, VIEW_ISO2, VIEW_ISO3):
-            w, h = image.size
-            size2 = (int(S60 * (w + h)), int(C60 * (w + h)))
-
-            if self.view == VIEW_ISO1:
-                transform = (
-                    0.5 / S60, 0.5 / C60, -h / 2, -0.5 / S60, 0.5 / C60, h / 2)
-                xy = self.plotCoords(
-                    [(probe.xmin, probe.ymin, 0.0),
-                     (probe.xmax, probe.ymin, 0.0)]
-                )
-                x = xy[0][0]
-                y = xy[1][1]
-
-            elif self.view == VIEW_ISO2:
-                transform = (
-                    0.5 / S60, -0.5 / C60, w / 2, 0.5 / S60, 0.5 / C60, -w / 2)
-
-                xy = self.plotCoords(
-                    [(probe.xmin, probe.ymax, 0.0),
-                     (probe.xmin, probe.ymin, 0.0)]
-                )
-                x = xy[0][0]
-                y = xy[1][1]
-            else:
-                transform = (
-                    -0.5 / S60,
-                    -0.5 / C60,
-                    w + h / 2,
-                    0.5 / S60,
-                    -0.5 / C60,
-                    h / 2,
-                )
-                xy = self.plotCoords(
-                    [(probe.xmax, probe.ymax, 0.0),
-                     (probe.xmin, probe.ymax, 0.0)]
-                )
-                x = xy[0][0]
-                y = xy[1][1]
-
-            affine = image.transform(
-                size2, Image.AFFINE, transform, resample=RESAMPLE)
-            # Super impose a white image
-            white = Image.new("RGBA", affine.size, (255,) * 4)
-            # compose the two images affine and white with mask the affine
-            image = Image.composite(affine, white, affine)
-            del white
-
-        else:
-            x, y = self.plotCoords([(probe.xmin, probe.ymin, 0.0)])[0]
-
-        self._probeTkImage = ImageTk.PhotoImage(image)
-        return x, y
-
     # ----------------------------------------------------------------------
     # Create paths for the whole gcode file
     # ----------------------------------------------------------------------
     def createPaths(self):
+        self.pathDict = {}
+
         if not self.draw_paths:
             for block in self.gcode.blocks:
                 block.resetPath()
@@ -3695,78 +3575,6 @@ class CNCCanvas(GLCanvas):
             
         return None
 
-    # ----------------------------------------------------------------------
-    # Return plotting coordinates for a 3d xyz path
-    #
-    # NOTE: Use the tkinter._flatten() to pass to self.coords() function
-    # ----------------------------------------------------------------------
-    def plotCoords(self, xyz):
-        coords = None
-        if self.view == VIEW_XY:
-            coords = [(p[0] * self.zoom, -p[1] * self.zoom) for p in xyz]
-        elif self.view == VIEW_XZ:
-            coords = [(p[0] * self.zoom, -p[2] * self.zoom) for p in xyz]
-        elif self.view == VIEW_YZ:
-            coords = [(p[1] * self.zoom, -p[2] * self.zoom) for p in xyz]
-        elif self.view == VIEW_ISO1:
-            coords = [
-                (
-                    (p[0] * S60 + p[1] * S60) * self.zoom,
-                    (+p[0] * C60 - p[1] * C60 - p[2]) * self.zoom,
-                )
-                for p in xyz
-            ]
-        elif self.view == VIEW_ISO2:
-            coords = [
-                (
-                    (p[0] * S60 - p[1] * S60) * self.zoom,
-                    (-p[0] * C60 - p[1] * C60 - p[2]) * self.zoom,
-                )
-                for p in xyz
-            ]
-        elif self.view == VIEW_ISO3:
-            coords = [
-                (
-                    (-p[0] * S60 - p[1] * S60) * self.zoom,
-                    (-p[0] * C60 + p[1] * C60 - p[2]) * self.zoom,
-                )
-                for p in xyz
-            ]
-        # Check limits
-        for i, (x, y) in enumerate(coords):
-            if abs(x) > MAXDIST or abs(y) > MAXDIST:
-                if x < -MAXDIST:
-                    x = -MAXDIST
-                elif x > MAXDIST:
-                    x = MAXDIST
-                if y < -MAXDIST:
-                    y = -MAXDIST
-                elif y > MAXDIST:
-                    y = MAXDIST
-                coords[i] = (x, y)
-        return coords
-
-    # ----------------------------------------------------------------------
-    # Canvas to real coordinates
-    # ----------------------------------------------------------------------
-    def canvas2xyz(self, i, j):
-        # Calculate the coords mapped from -1.0 to +1.0
-        x = -1.0 + 2 * i / self.winfo_width()
-        y = +1.0 - 2 * j / self.winfo_height()
-        z = 0
-
-        # Calculate xyz coords
-        MVP = self.PMatrix * self.MVMatrix
-
-        # Calculate the inverse of MVP
-        MVPinv = inverse(MVP)
-
-        # 3D Coords
-        coords_3d = MVPinv * vec4(x, y, z, 1)
-
-        return coords_3d.x, coords_3d.y, coords_3d.z
-
-
 # =============================================================================
 # Canvas Frame with toolbar
 # =============================================================================
@@ -3800,12 +3608,6 @@ class CanvasFrame(Frame):
         # OpenGL context
         print(f"self.canvas.winfo_id(): {self.canvas.winfo_id()}")
         self.canvas.grid(row=1, column=0, sticky=NSEW)
-        """ sb = Scrollbar(self, orient=VERTICAL, command=self.canvas.yview)
-        sb.grid(row=1, column=1, sticky=NS)
-        self.canvas.config(yscrollcommand=sb.set)
-        sb = Scrollbar(self, orient=HORIZONTAL, command=self.canvas.xview)
-        sb.grid(row=2, column=0, sticky=EW)
-        self.canvas.config(xscrollcommand=sb.set) """
 
         self.createCanvasToolbar(toolbar)
 
@@ -4029,7 +3831,7 @@ class CanvasFrame(Frame):
             b.config(state=DISABLED)
 
         b = Button(toolbar, image=Utils.icons["refresh"],
-                   command=self.viewChange)
+                   command=self.canvas.updateAll)
         tkExtra.Balloon.set(b, _("Redraw display [Ctrl-R]"))
         b.pack(side=LEFT)
 
