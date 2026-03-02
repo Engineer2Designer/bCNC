@@ -6,6 +6,23 @@
 import math
 import time
 import sys
+from numpy import deg2rad
+from tkinter_gl import GLCanvas
+
+import OpenGL
+if sys.platform == 'linux':
+    # PyOpenGL is broken with wayland:
+    OpenGL.setPlatform('x11')
+
+try:
+    import cv2 as cv
+except ImportError:
+    cv = None
+
+from OpenGL.GL import *
+from ctypes import c_void_p
+from pyglm.glm import mat4x4, mat3x3, ortho, identity, value_ptr, inverse, translate, rotate, vec2, vec3, vec4, inverse, normalize, lookAt, dot, cross, distance, length2
+import os
 
 from tkinter import (
     TclError,
@@ -48,11 +65,11 @@ import bmath
 import Camera
 import tkExtra
 import Utils
-from CNC import CNC
+from CNC import CNC, Probe
 
 # Probe mapping we need PIL and numpy
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageTk, ImageFont, ImageDraw
     import numpy
 
     # Resampling image based on PIL library and converting to RGB.
@@ -62,6 +79,20 @@ except Exception:
     from tkinter import Image
     numpy = None
     RESAMPLE = None
+
+try:
+    import OpenGL
+    if sys.platform == 'linux':
+        # PyOpenGL is broken with wayland:
+        OpenGL.setPlatform('x11')
+    from OpenGL import GL
+except ImportError:
+    raise ImportError(
+        """
+        This example requires PyOpenGL.
+
+        You can install it with "pip install PyOpenGL".
+        """)
 
 ANTIALIAS_CHEAP = False
 
@@ -98,12 +129,10 @@ SELECT2_COLOR = "DarkCyan"
 PROCESS_COLOR = "Green"
 
 MOVE_COLOR = "DarkCyan"
-RULER_COLOR = "Green"
+RULER_COLOR = "White"
 PROBE_TEXT_COLOR = "Green"
 
 INFO_COLOR = "Gold"
-
-SELECTION_TAGS = ("sel", "sel2", "sel3", "sel4")
 
 ACTION_SELECT = 0
 ACTION_SELECT_SINGLE = 1
@@ -128,6 +157,7 @@ CONTROLSHIFT_MASK = SHIFT_MASK | CONTROL_MASK
 CLOSE_DISTANCE = 5
 MAXDIST = 10000
 ZOOM = 1.25
+AXIS_LENGTH = 100 # Coord system axis length in pixels
 
 S60 = math.sin(math.radians(60))
 C60 = math.cos(math.radians(60))
@@ -146,12 +176,19 @@ MOUSE_CURSOR = {
     ACTION_ADDORIENT: "tcross",
 }
 
+# Path lines Flags are stored in a float32 value for each vertex. 
+# Each flag is represented by a bit in that value. It can store up to 24 tags (24 representative bits in an integer float32)
+FLAG_SELECTED = 0b1
+FLAG_ENABLED = 0b10
+#FLAG_XXX = 0b100
+#FLAG_XXX = 0b1000
+
+openglFolder = f"{os.path.abspath(os.path.dirname(__file__))}{os.sep}opengl{os.sep}"
 
 # -----------------------------------------------------------------------------
 def mouseCursor(action):
     return MOUSE_CURSOR.get(action, DEF_CURSOR)
-
-
+    
 # =============================================================================
 # Raise an alarm exception
 # =============================================================================
@@ -162,9 +199,14 @@ class AlarmException(Exception):
 # =============================================================================
 # Drawing canvas
 # =============================================================================
-class CNCCanvas(Canvas):
+class CNCCanvas(GLCanvas):
+    def rgb8(self, colorName):
+        return (numpy.array(self.winfo_rgb(colorName)) * 255. / 65535.).astype(int)
+
     def __init__(self, master, app, *kw, **kwargs):
-        Canvas.__init__(self, master, *kw, **kwargs)
+        super().__init__(master) # TODO: Handle takefocus and background parameters
+
+        profile = 'legacy' # Opengl 2.1
 
         # Global variables
         self.view = 0
@@ -176,17 +218,20 @@ class CNCCanvas(Canvas):
         # Canvas binding
         self.bind("<Configure>", self.configureEvent)
         self.bind("<Motion>", self.motion)
-
         self.bind("<Button-1>", self.click)
         self.bind("<B1-Motion>", self.buttonMotion)
         self.bind("<ButtonRelease-1>", self.release)
         self.bind("<Double-1>", self.double)
 
+        self.bind("<Button-2>", self.midClick)
         self.bind("<B2-Motion>", self.pan)
-        self.bind("<ButtonRelease-2>", self.panRelease)
+        self.bind("<ButtonRelease-2>", self.midRelease)
         self.bind("<Button-4>", self.mouseZoomIn)
         self.bind("<Button-5>", self.mouseZoomOut)
         self.bind("<MouseWheel>", self.wheel)
+        self.bind("<Button-3>", self.rightClick)
+        self.bind("<B3-Motion>", self.rotate)
+        self.bind("<ButtonRelease-3>", self.rightRelease)
 
         self.bind("<Shift-Button-4>", self.panLeft)
         self.bind("<Shift-Button-5>", self.panRight)
@@ -202,35 +247,33 @@ class CNCCanvas(Canvas):
         self.bind("<Key>", self.handleKey)
 
         self.bind("<Control-Key-S>", self.cameraSave)
-        self.bind("<Control-Key-t>", self.__test)
 
         self.bind("<Control-Key-equal>", self.menuZoomIn)
         self.bind("<Control-Key-minus>", self.menuZoomOut)
 
         self.x0 = 0.0
         self.y0 = 0.0
-        self.zoom = 1.0
+        self.zoom = 1.
         self.__tzoom = 1.0  # delayed zoom (temporary)
         self._items = {}
-
         self._x = self._y = 0
         self._xp = self._yp = 0
         self.action = ACTION_SELECT
         self._mouseAction = None
-        self._inDraw = False  # semaphore for parsing
-        self._gantry1 = None
-        self._gantry2 = None
-        self._select = None
-        self._margin = None
-        self._amargin = None
-        self._workarea = None
         self._vector = None
         self._lastActive = None
         self._lastGantry = None
+        self._gantryLocation = vec3(0, 0, 0)
+        self._drawRequested = False
+
+        self._snapPoint = None
 
         self._probeImage = None
         self._probeTkImage = None
         self._probe = None
+        self.probeMaxZ = 10
+        self.probeMinZ = -10
+        self.probeMaxHeight = 10
 
         self.camera = Camera.Camera("aligncam")
         self.cameraAnchor = CENTER  # Camera anchor location "" for gantry
@@ -244,14 +287,9 @@ class CNCCanvas(Canvas):
         self.cameraDy = 0
         self.cameraZ = None  # if None it will not make any Z movement for the camera
         self.cameraSwitch = False  # Look at spindle(False) or camera(True)
+        self.cameraLocation = vec2(0., 0.)
         self._cameraAfter = None  # Camera anchor location "" for gantry
-        self._cameraMaxWidth = 640  # on zoom over this size crop the image
-        self._cameraMaxHeight = 480
-        self._cameraImage = None
-        self._cameraHori = None  # cross hair items
-        self._cameraVert = None
-        self._cameraCircle = None
-        self._cameraCircle2 = None
+        self._showCamera = False
 
         self.draw_axes = True  # Drawing flags
         self.draw_grid = True
@@ -263,13 +301,682 @@ class CNCCanvas(Canvas):
         self._wx = self._wy = self._wz = 0.0  # work position
         self._dx = self._dy = self._dz = 0.0  # work-machine position
 
-        self._vx0 = self._vy0 = self._vz0 = 0  # vector move coordinates
-        self._vx1 = self._vy1 = self._vz1 = 0  # vector move coordinates
-
         self._orientSelected = None
 
+        # OPENGL vars
+        self.MVMatrix = identity(mat4x4) # Model View Matrix
+        self.PMatrix = ortho(-100, 100, -100, 100, -10000, 10000) # Projection matrix. Updated on resize
+        
+        # self.lines: Dictionary of lines to be drawn. 
+        # key: line_id (We increment it for each new line)
+        self._line_id = 1
+        # item: [x1, y1, z1, x2, y2, z2, dashRatio, selected]
+        # dashRatio: 0-1. 1 is solid line
+        # Selected: 1 or 0
+        self.pathDict = {}
+        self.orientDict = {}
+        self.probeDict = {}
+        self.vectorDict = {}
+        
+        self.infoVertices = numpy.array([], dtype=numpy.float32)
+        self.pathVertices = numpy.array([], dtype=numpy.float32)
+
+        # Selection Rectangle
+        self.SelectionRectVertices = numpy.array([], dtype=numpy.float32)
+        
+        self.pathArrows = {}
+        self.infoArrows = {}
+        self.vectorArrowsDict = {}
+        
+        self._modelCenter = vec3(0, 0, 0)
+        self._modelSize = 100.0
+        # Text items
+        self._text_id = 1
+        self.text = {} # text_id[location, text value, color]
+        self.probeText = {}
+        # Background gradiend colors
+        self.bgColorUp = vec3(0.175, 0.215, 0.392)
+        self.bgColorDn = vec3(0.4, 0.4, 0.6)
+        
         self.reset()
+        self.initGL()
+
+        # Data of Texture atlas for text rendering
+        self.charOffsetAndWidth = []
+        self.create_char_texture("./bCNC/opengl/DejaVuSans.ttf", 12)
+
+        self.createAxes(AXIS_LENGTH)
+        self.createGantry()
+
         self.initPosition()
+    
+    def get_camera_image(self):
+        if (self.camera.image is None) or (cv is None):
+            return None
+        
+        tex = cv.flip(cv.cvtColor(self.camera.image, cv.COLOR_BGR2RGBA), 0)
+    
+        return tex
+
+    def create_char_texture(self, font_name, font_size):
+        font = ImageFont.truetype(font_name, font_size)
+
+        # Get font metrics (ascent = top above baseline, descent = below baseline)
+        ascent, descent = font.getmetrics()
+
+        # Full safe height for drawing
+        self.textHeight = ascent + descent
+
+        # Get the width and offset of each char
+        offset = 0
+        for ch in range(128):
+            width = font.getlength(chr(ch))
+            self.charOffsetAndWidth.append([offset, width])
+            offset += width
+        
+        image = Image.new("RGBA", (int(offset), int(self.textHeight)), (0, 0, 0, 0)) # type: ignore
+        
+        # Create a drawing object
+        draw = ImageDraw.Draw(image)
+
+        # Create an image with all the ascii chars
+        for ch in range(128):
+            draw.text((self.charOffsetAndWidth[ch][0], 0), chr(ch), fill="white", font=font)
+        
+        image = image.transpose(Image.FLIP_TOP_BOTTOM)  # OpenGL expects the y-axis to be flipped
+
+        self.charTextureAtlas = numpy.array(image)
+
+        glBindTexture(GL_TEXTURE_2D, self.textTexture)
+
+        # Set the texture parameters
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+
+        # Upload texture data to OpenGL
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, len(self.charTextureAtlas[0]), len(self.charTextureAtlas), 0, GL_RGBA, GL_UNSIGNED_BYTE, self.charTextureAtlas)
+
+        # Generate Mipmap
+        glGenerateMipmap(GL_TEXTURE_2D)
+    
+    def create_text(self, textDict, location, text, color):
+        # Color is a tuple or numpy array of three 8bit integers
+        textDict[self._text_id] = [location, text, color]
+
+        id = self._text_id
+        self._text_id += 1
+
+        return id
+
+    def initGL(self):
+        # Create all the OpenGL shader programs
+
+        # ----- BACKGROUND PROGRAM ------
+        # Vertex Shader code
+        with open(openglFolder + "BackgroundVS.shd", "r") as file:
+            BackgroundVSCode = file.read()
+
+        # Fragment Shader code
+        with open(openglFolder + "BackgroundFS.shd", "r") as file:
+            BackgroundFSCode = file.read()
+
+        self.backgroundProgram = self.createProgram(BackgroundVSCode, BackgroundFSCode)
+
+        # Create a Vertex Buffer Object (VBO)
+        self.backgroundVBO = glGenBuffers(1)
+        
+        # Since the background is fixed, we set the buffer data here
+        glUseProgram(self.backgroundProgram)      
+        glBindBuffer(GL_ARRAY_BUFFER, self.backgroundVBO)
+        
+        vertices = numpy.array([
+            1, 1, 0, self.bgColorUp.x, self.bgColorUp.y, self.bgColorUp.z,
+            -1, 1, 0, self.bgColorUp.x, self.bgColorUp.y, self.bgColorUp.z,
+            -1, -1, 0, self.bgColorDn.x, self.bgColorDn.y, self.bgColorDn.z,
+            1, 1, 0, self.bgColorUp.x, self.bgColorUp.y, self.bgColorUp.z,
+            -1, -1, 0, self.bgColorDn.x, self.bgColorDn.y, self.bgColorDn.z,
+            1, -1, 0, self.bgColorDn.x, self.bgColorDn.y, self.bgColorDn.z
+        ], dtype=numpy.float32)
+        
+        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_STATIC_DRAW)
+        
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+        
+        # ----- LINES PROGRAM ------
+        # Vertex Shader code
+        with open(openglFolder + "LinesVS.shd", "r") as file:
+            LinesVSCode = file.read()
+
+        # Fragment Shader code
+        with open(openglFolder + "LinesFS.shd", "r") as file:
+            LinesFSCode = file.read()
+
+        self.linesProgram = self.createProgram(LinesVSCode, LinesFSCode)
+        
+        # Create a Vertex Buffer Object (VBO)
+        self.pathVBO = glGenBuffers(1)
+        self.marginsVBO = glGenBuffers(1)
+        self.workAreaVBO = glGenBuffers(1)
+        self.infoVBO = glGenBuffers(1)
+        self.orientVBO = glGenBuffers(1)
+        self.probeVBO = glGenBuffers(1)
+        self.vectorVBO = glGenBuffers(1)
+        self.gridVBO = glGenBuffers(1)
+        
+        # ----- AXES PROGRAM ------
+        # Vertex Shader code
+        with open(openglFolder + "AxesVS.shd", "r") as file:
+            AxesVSCode = file.read()
+
+        # Fragment Shader code
+        with open(openglFolder + "AxesFS.shd", "r") as file:
+            AxesFSCode = file.read()
+
+        self.axesProgram = self.createProgram(AxesVSCode, AxesFSCode)
+        
+        # Create a Vertex Buffer Object (VBO)
+        self.axesVBO = glGenBuffers(1)
+        
+        # ----- GANTRY PROGRAM ------
+        # Vertex Shader code
+        with open(openglFolder + "GantryVS.shd", "r") as file:
+            GantryVSCode = file.read()
+
+        # Fragment Shader code
+        with open(openglFolder + "GantryFS.shd", "r") as file:
+            GantryFSCode = file.read()
+
+        self.gantryProgram = self.createProgram(GantryVSCode, GantryFSCode)
+        
+        # Create a Vertex Buffer Object (VBO)
+        self.gantryVBO = glGenBuffers(1)
+
+        # ----- SELECTION RECT PROGRAM ------
+        # Program to draw the selection rectangle
+        # Vertex Shader code
+        with open(openglFolder + "SelectionRectVS.shd", "r") as file:
+            SelectionRectVSCode = file.read()
+
+        # Fragment Shader code
+        with open(openglFolder + "SelectionRectFS.shd", "r") as file:
+            SelectionRectFSCode = file.read()
+
+        self.SelectionRectProgram = self.createProgram(SelectionRectVSCode, SelectionRectFSCode)
+        
+        # Create a Vertex Buffer Object (VBO)
+        self.SelectionRectVBO = glGenBuffers(1)
+
+        # ----- TEXT PROGRAM ------
+        # Program to draw text
+        # Vertex Shader code
+        with open(openglFolder + "TextVS.shd", "r") as file:
+            TextVSCode = file.read()
+
+        # Fragment Shader code
+        with open(openglFolder + "TextFS.shd", "r") as file:
+            TextFSCode = file.read()
+
+        self.TextProgram = self.createProgram(TextVSCode, TextFSCode)
+        
+        # Create a Vertex Buffer Object (VBO)
+        self.TextVBO = glGenBuffers(1)
+        self.AxesTextVBO = glGenBuffers(1)
+        self.ProbeTextVBO = glGenBuffers(1)
+
+        # ----- PROBE MAP PROGRAM ------
+        # Program to draw text
+        # Vertex Shader code
+        with open(openglFolder + "ProbeMapVS.shd", "r") as file:
+            ProbeMapVSCode = file.read()
+
+        # Fragment Shader code
+        with open(openglFolder + "ProbeMapFS.shd", "r") as file:
+            ProbeMapFSCode = file.read()
+
+        self.ProbeMapProgram = self.createProgram(ProbeMapVSCode, ProbeMapFSCode)
+        
+        # Create a Vertex Buffer Object (VBO)
+        self.ProbeMapVBO = glGenBuffers(1)
+
+        # ----- IMAGE PROGRAM ------
+        # Program to draw images
+        # Vertex Shader code
+        with open(openglFolder + "ImageVS.shd", "r") as file:
+            ImageVSCode = file.read()
+
+        # Fragment Shader code
+        with open(openglFolder + "ImageFS.shd", "r") as file:
+            ImageFSCode = file.read()
+
+        self.ImageProgram = self.createProgram(ImageVSCode, ImageFSCode)
+        
+        # Create a Vertex Buffer Object (VBO)
+        self.CameraVBO = glGenBuffers(1)
+
+        # Create textures
+        self.textTexture = glGenTextures(1)
+        self.cameraTexture = glGenTextures(1)
+
+        # Fill the buffer of the camera rectangle, which is fixed
+        glBindBuffer(GL_ARRAY_BUFFER, self.CameraVBO)
+        CameraRectVertices = numpy.array([1., 2., 3., 1., 3., 4.], dtype=numpy.float32)
+        glBufferData(GL_ARRAY_BUFFER, CameraRectVertices.nbytes, CameraRectVertices, GL_STATIC_DRAW)
+        
+        # ----- ARROW PROGRAM ------
+        # Program to draw arrows
+        # Vertex Shader code
+        with open(openglFolder + "ArrowVS.shd", "r") as file:
+            ArrowVSCode = file.read()
+
+        # Fragment Shader code
+        with open(openglFolder + "ArrowFS.shd", "r") as file:
+            ArrowFSCode = file.read()
+
+        self.ArrowProgram = self.createProgram(ArrowVSCode, ArrowFSCode)
+        
+        # Create a Vertex Buffer Object (VBO)
+        self.pathArrowsVBO = glGenBuffers(1)
+        self.infoArrowsVBO = glGenBuffers(1)
+        self.vectorArrowsVBO = glGenBuffers(1)
+        
+        # ----- CROSSHAIR PROGRAM ------
+        # Program to draw the Camera Crosshair
+        # Vertex Shader code
+        with open(openglFolder + "CrossHairVS.shd", "r") as file:
+            CrossHairVSCode = file.read()
+
+        # Fragment Shader code
+        with open(openglFolder + "CrossHairFS.shd", "r") as file:
+            CrossHairFSCode = file.read()
+
+        self.CrossHairProgram = self.createProgram(CrossHairVSCode, CrossHairFSCode)
+        
+        # Create a Vertex Buffer Object (VBO)
+        self.CrossHairVBO = glGenBuffers(1)
+
+        # Fill the buffer of the crosshair, which is fixed
+        glBindBuffer(GL_ARRAY_BUFFER, self.CrossHairVBO)
+        CrossHairVertices = numpy.arange(1, 293, dtype=numpy.float32)
+        glBufferData(GL_ARRAY_BUFFER, CrossHairVertices.nbytes, CrossHairVertices, GL_STATIC_DRAW)
+
+    # ----- SNAP POINT PROGRAM ------
+        # Program to draw the Snap Point
+        # Vertex Shader code
+        with open(openglFolder + "SnapPointVS.shd", "r") as file:
+            SnapPointVSCode = file.read()
+
+        # Fragment Shader code
+        with open(openglFolder + "SnapPointFS.shd", "r") as file:
+            SnapPointFSCode = file.read()
+
+        self.SnapPointProgram = self.createProgram(SnapPointVSCode, SnapPointFSCode)
+        
+        # Create a Vertex Buffer Object (VBO)
+        self.SnapPointVBO = glGenBuffers(1)
+
+        # Fill the buffer of the snappoint, which is fixed
+        glBindBuffer(GL_ARRAY_BUFFER, self.SnapPointVBO)
+        SnapPointVertices = numpy.array([1, 2, 3, 4, 1], dtype=numpy.float32)
+        glBufferData(GL_ARRAY_BUFFER, SnapPointVertices.nbytes, SnapPointVertices, GL_STATIC_DRAW)
+
+        glClearColor(1.0, 1.0, 1.0, 1.0)
+        
+    def createProgram(self, vertexShaderCode, fragmentShaderCode):
+        # Compile Vertex Shader
+        vertex_shader = glCreateShader(GL_VERTEX_SHADER)
+        glShaderSource(vertex_shader, vertexShaderCode)
+        glCompileShader(vertex_shader)
+        if not glGetShaderiv(vertex_shader, GL_COMPILE_STATUS):
+            raise RuntimeError(glGetShaderInfoLog(vertex_shader))
+
+        # Compile Fragment Shader
+        fragment_shader = glCreateShader(GL_FRAGMENT_SHADER)
+        glShaderSource(fragment_shader, fragmentShaderCode)
+        glCompileShader(fragment_shader)
+        if not glGetShaderiv(fragment_shader, GL_COMPILE_STATUS):
+            raise RuntimeError(glGetShaderInfoLog(fragment_shader))
+
+        # Link Shaders into a Program
+        shader_program = glCreateProgram()
+        glAttachShader(shader_program, vertex_shader)
+        glAttachShader(shader_program, fragment_shader)
+        glLinkProgram(shader_program)
+        if not glGetProgramiv(shader_program, GL_LINK_STATUS):
+            raise RuntimeError(glGetProgramInfoLog(shader_program))
+
+        # Clean up shaders (no longer needed after linking)
+        glDeleteShader(vertex_shader)
+        glDeleteShader(fragment_shader)
+        
+        return shader_program
+        
+    def create_line(self, linesDict, xyz, colorRGB, dashRatio, flags = FLAG_ENABLED):
+        # xyz is an array of arrays of 3d coords
+        linesDict[self._line_id] = [xyz, colorRGB, dashRatio, flags]
+        
+        id = self._line_id
+        # Increment the line id for the next line
+        self._line_id += 1
+        
+        return id
+    
+    def create_arrow(self, arrows, id, location, direction, width, height, colorRGB, flags = FLAG_ENABLED):
+        arrows[id] = [location, direction, width, height, colorRGB, flags]
+    
+    def set_arrow(self, arrows, arrowsBuffer, linesVertices, lineId, position, width = 0, height = 0):
+        """
+        Add arrow to a line id from the numpy array linesVertices.
+        Position can be 'none', 'first', 'last' or 'both'
+        """
+
+        if position == 'none':
+            if (lineId + 0.1) in arrows:
+                del arrows[lineId + 0.1]
+
+            if (lineId + 0.2) in arrows:
+                del arrows[lineId + 0.2]
+        
+        else:
+            lines16 = numpy.reshape(linesVertices, (-1, 16))
+            line16 = lines16[lines16[:, 0] == lineId]
+
+            if len(line16) == 0:
+                return
+            
+            if position == 'first' or position == 'both':
+                p_tip = vec3(line16[0, 1:4])
+                p_base = vec3(line16[0, 9:12])
+                dir = p_tip - p_base
+                colorValue = line16[0, 5]
+                R = (int(colorValue) & 0xFF0000) >> 16
+                G = (int(colorValue) & 0xFF00) >> 8
+                B = int(colorValue) & 0xFF
+                colorRGB = [R, G, B]
+                flags = line16[0, 7]
+
+                self.create_arrow(arrows, lineId + 0.1, p_tip, dir, width, height, colorRGB, flags)
+            
+            if position == 'last' or position == 'both':
+                p_tip = vec3(line16[-1, 9:12])
+                p_base = vec3(line16[-1, 1:4])
+                dir = p_tip - p_base
+                colorValue = line16[-1, 5]
+                R = (int(colorValue) & 0xFF0000) >> 16
+                G = (int(colorValue) & 0xFF00) >> 8
+                B = int(colorValue) & 0xFF
+                colorRGB = [R, G, B]
+                flags = line16[-1, 7]
+
+                self.create_arrow(arrows, lineId + 0.2, p_tip, dir, width, height, colorRGB, flags)
+        
+        self.update_arrows_buffer(arrowsBuffer, arrows)
+
+
+    
+    def create_oval(self, lines, xyz_bottomleft, xyz_topright, colorRGB, dashRatio, flags = FLAG_ENABLED):
+        p_bl = vec3(xyz_bottomleft)
+        p_tr = vec3(xyz_topright)
+        center = (p_bl + p_tr) / 2.
+        Rx = abs(p_tr.x - center.x)
+        Ry = abs(p_tr.y - center.y)
+        
+        xyz = []
+        
+        for angle in range(0, 360, 5):
+            xyz.append([center.x + Rx * numpy.cos(numpy.deg2rad(angle)),
+                        center.y + Ry * numpy.sin(numpy.deg2rad(angle)),
+                        center.z])
+            xyz.append([center.x + Rx * numpy.cos(numpy.deg2rad(angle + 5)),
+                        center.y + Ry * numpy.sin(numpy.deg2rad(angle + 5)),
+                        center.z])
+            
+        
+        return self.create_line(lines, xyz, colorRGB, dashRatio, flags)
+    
+    def update_lines_buffer(self, buffer, linesDict, updateModelDimensions = False):        
+        # In order to be compatible with Pi 3, we are using GLSL 1.0. It doesn't allow constant parameters per line in the fragment shader. They are always
+        # interpolated between vertices. Then, we must assign the parameter twice, once per vertex, with the same value
+        vertexArray = []
+        
+        maxX = maxY = maxZ = -999999
+        minX = minY = minZ = 999999
+        
+        for id, data in linesDict.items():
+            xyz = data[0]
+            # We take xyz coords in pairs to create separate lines
+            for i in range(len(xyz) - 1):
+                
+                length = math.sqrt(math.pow(xyz[i+1][0]-xyz[i][0], 2) + math.pow(xyz[i+1][1]-xyz[i][1], 2) + math.pow(xyz[i+1][2]-xyz[i][2], 2))
+                colorValue = (data[1][0] << 16) + (data[1][1] << 8) + data[1][2] # RGB
+                
+                vertexArray.extend([
+                    # Vertex 1
+                    id,
+                    xyz[i][0], # x1
+                    xyz[i][1], # y1
+                    xyz[i][2], # z1
+                    0, # 0 for starting point, length for end point
+                    colorValue, # RGB
+                    data[2], # dashRatio
+                    data[3], # flags
+                    # Vertex 2
+                    id,
+                    xyz[i+1][0], # x1
+                    xyz[i+1][1], # y1
+                    xyz[i+1][2], # z1
+                    length,
+                    colorValue, # RGB
+                    data[2], # dashRatio
+                    data[3], # flags
+                ])
+                
+                if updateModelDimensions:
+                    maxX = max(max(maxX, xyz[i][0]), xyz[i+1][0])
+                    maxY = max(max(maxY, xyz[i][1]), xyz[i+1][1])
+                    maxZ = max(max(maxZ, xyz[i][2]), xyz[i+1][2])
+                    minX = min(min(minX, xyz[i][0]), xyz[i+1][0])
+                    minY = min(min(minY, xyz[i][1]), xyz[i+1][1])
+                    minZ = min(min(minZ, xyz[i][2]), xyz[i+1][2])
+
+        if updateModelDimensions:
+            if len(linesDict) == 0:
+                self._modelCenter = vec3(0, 0, 0)
+                self._modelSize = 100
+            else:
+                self._modelCenter = vec3((maxX + minX) / 2, (maxY + minY) / 2, (maxZ + minZ) / 2)
+                self._modelSize = math.sqrt(math.pow(maxX-minX, 2) + math.pow(maxY-minY, 2) + math.pow(maxZ-minZ, 2))
+        
+        vertices = numpy.array(vertexArray, dtype=numpy.float32)
+        
+        glBindBuffer(GL_ARRAY_BUFFER, buffer)
+        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_DYNAMIC_DRAW)
+
+        glBindBuffer(GL_ARRAY_BUFFER, 0)  # Unbind the VBO
+
+        return vertices
+    
+    def update_arrows_from_lines(self, arrows, arrowsBuffer, linesVertices):
+        """
+        Update arrow color and flags from lines
+        """
+
+        if len(arrows) == 0:
+            return
+        
+        lines16 = numpy.reshape(linesVertices, (-1, 16))
+
+        for arrowId in arrows:
+            lineId = int(arrowId)
+            line16 = lines16[lines16[:, 0] == lineId]
+            if len(line16 > 0):
+                line16 = line16[0]
+                #arrows[id] = [location, direction, width, height, colorRGB, flags]
+
+                # Copy color from line
+                colorValue = line16[5]
+                R = (int(colorValue) & 0xFF0000) >> 16
+                G = (int(colorValue) & 0xFF00) >> 8
+                B = int(colorValue) & 0xFF
+                colorRGB = [R, G, B]
+                arrows[arrowId][4] = colorRGB
+                
+                # Copy flags from line
+                arrows[arrowId][5] = line16[7]
+        
+        self.update_arrows_buffer(arrowsBuffer, arrows)
+
+
+    def update_arrows_buffer(self, buffer, arrows):        
+        vertexArray = []
+        
+        for id, data in arrows.items():
+            colorValue = (data[4][0] << 16) + (data[4][1] << 8) + data[4][2] # RGB
+            
+            vertexArray.extend([
+                # Vertex 1
+                id,
+                1.,
+                data[0][0], # location.x
+                data[0][1], # location.y
+                data[0][2], # location.z
+                data[1][0], # direction.x
+                data[1][1], # direction.y
+                data[1][2], # direction.z
+                data[2], # width
+                data[3], # height
+                colorValue,
+                data[5], # flags
+                # Vertex 2
+                id,
+                2.,
+                data[0][0], # location.x
+                data[0][1], # location.y
+                data[0][2], # location.z
+                data[1][0], # direction.x
+                data[1][1], # direction.y
+                data[1][2], # direction.z
+                data[2], # width
+                data[3], # height
+                colorValue,
+                data[5], # flags
+                # Vertex 3
+                id,
+                3.,
+                data[0][0], # location.x
+                data[0][1], # location.y
+                data[0][2], # location.z
+                data[1][0], # direction.x
+                data[1][1], # direction.y
+                data[1][2], # direction.z
+                data[2], # width
+                data[3], # height
+                colorValue,
+                data[5], # flags
+            ])
+        
+        vertices = numpy.array(vertexArray, dtype=numpy.float32)
+        
+        glBindBuffer(GL_ARRAY_BUFFER, buffer)
+        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_DYNAMIC_DRAW)
+
+        glBindBuffer(GL_ARRAY_BUFFER, 0)  # Unbind the VBO
+
+        return vertices
+    
+    def update_text_buffer(self, buffer, textDict: dict):
+        char_data = []
+        
+        for id in textDict.keys():
+            hOffset = 0
+
+            location = textDict[id][0]
+            text = textDict[id][1]
+            color = textDict[id][2]
+            colorValue = (color[0] << 16) + (color[1] << 8) + color[2] # RGB
+
+            for ch in range(len(text)):
+                # We define a quad as 2 triangles (6 vertices)
+                char_data.extend([
+                # Bottom left
+                    id, # Text id
+                    1, # Vertex index
+                    location[0], # Location of the bottom left corner
+                    location[1],
+                    location[2],
+                    hOffset,
+                    self.charOffsetAndWidth[ord(text[ch])][0], # Char offset in texture atlas in pixels
+                    self.charOffsetAndWidth[ord(text[ch])][1], # Char width in texture atlas in pixels
+                    self.textHeight, #Char height in texture atlas
+                    colorValue,
+                # Bottom left
+                    id, # Text id
+                    2, # Vertex index
+                    location[0], # Location of the bottom left corner
+                    location[1],
+                    location[2],
+                    hOffset,
+                    self.charOffsetAndWidth[ord(text[ch])][0], # Char offset in texture atlas in pixels
+                    self.charOffsetAndWidth[ord(text[ch])][1], # Char width in texture atlas in pixels
+                    self.textHeight, #Char height in texture atlas
+                    colorValue,
+                # Bottom left
+                    id, # Text id
+                    3, # Vertex index
+                    location[0], # Location of the bottom left corner
+                    location[1],
+                    location[2],
+                    hOffset,
+                    self.charOffsetAndWidth[ord(text[ch])][0], # Char offset in texture atlas in pixels
+                    self.charOffsetAndWidth[ord(text[ch])][1], # Char width in texture atlas in pixels
+                    self.textHeight, #Char height in texture atlas
+                    colorValue,
+                # Bottom left
+                    id, # Text id
+                    1, # Vertex index
+                    location[0], # Location of the bottom left corner
+                    location[1],
+                    location[2],
+                    hOffset,
+                    self.charOffsetAndWidth[ord(text[ch])][0], # Char offset in texture atlas in pixels
+                    self.charOffsetAndWidth[ord(text[ch])][1], # Char width in texture atlas in pixels
+                    self.textHeight, #Char height in texture atlas
+                    colorValue,
+                # Bottom left
+                    id, # Text id
+                    3, # Vertex index
+                    location[0], # Location of the bottom left corner
+                    location[1],
+                    location[2],
+                    hOffset,
+                    self.charOffsetAndWidth[ord(text[ch])][0], # Char offset in texture atlas in pixels
+                    self.charOffsetAndWidth[ord(text[ch])][1], # Char width in texture atlas in pixels
+                    self.textHeight, #Char height in texture atlas
+                    colorValue,
+                # Bottom left
+                    id, # Text id
+                    4, # Vertex index
+                    location[0], # Location of the bottom left corner
+                    location[1],
+                    location[2],
+                    hOffset,
+                    self.charOffsetAndWidth[ord(text[ch])][0], # Char offset in texture atlas in pixels
+                    self.charOffsetAndWidth[ord(text[ch])][1], # Char width in texture atlas in pixels
+                    self.textHeight, #Char height in texture atlas
+                    colorValue,
+                ])
+
+                hOffset += self.charOffsetAndWidth[ord(text[ch])][1]
+            
+        textVertices = numpy.array(char_data, dtype=numpy.float32)
+        
+        glBindBuffer(GL_ARRAY_BUFFER, buffer)
+        glBufferData(GL_ARRAY_BUFFER, textVertices.nbytes, textVertices, GL_DYNAMIC_DRAW)
+
+        glBindBuffer(GL_ARRAY_BUFFER, 0)  # Unbind the VBO
+
+        return textVertices
 
     # Calculate arguments for antialiasing
     def antialias_args(self, args, winc=0.5, cw=2):
@@ -300,14 +1007,6 @@ class CNCCanvas(Canvas):
 
         return nargs
 
-    # Override alias method if antialiasing enabled:
-    if ANTIALIAS_CHEAP:
-
-        def create_line(self, *args, **kwargs):
-            nkwargs = self.antialias_args(kwargs)
-            super().create_line(*args, **nkwargs)
-            return super().create_line(*args, **kwargs)
-
     # ----------------------------------------------------------------------
     def reset(self):
         self.zoom = 1.0
@@ -320,25 +1019,10 @@ class CNCCanvas(Canvas):
 
     # ----------------------------------------------------------------------
     def setMouseStatus(self, event):
-        data = "%.4f %.4f %.4f" % self.canvas2xyz(
-            self.canvasx(event.x), self.canvasy(event.y)
-        )
-        self.event_generate("<<Coords>>", data=data)
-
-    # ----------------------------------------------------------------------
-    # Update scrollbars
-    # ----------------------------------------------------------------------
-    def _updateScrollBars(self):
-        """Update scroll region for new size"""
-        bb = self.bbox("all")
-        if bb is None:
-            return
-        x1, y1, x2, y2 = bb
-        dx = x2 - x1
-        dy = y2 - y1
-        # make it 3 times bigger in each dimension
-        # so when we zoom in/out we don't touch the borders
-        self.configure(scrollregion=(x1 - dx, y1 - dy, x2 + dx, y2 + dy))
+        xy_w = self.canvas2WorldXY(vec2(event.x, event.y), 0)
+        if xy_w is not None:
+            data = "%.4f %.4f %.4f" % (xy_w.x, xy_w.y, 0)
+            self.event_generate("<<Coords>>", data=data)
 
     # ----------------------------------------------------------------------
     def handleKey(self, event):
@@ -376,7 +1060,15 @@ class CNCCanvas(Canvas):
         self.action = action
         self.actionVar.set(action)
         self._mouseAction = None
-        self.config(cursor=mouseCursor(self.action), background="White")
+        self.configure(cursor=mouseCursor(self.action))
+
+        if self.action == ACTION_SELECT:
+            self._snapPoint = None
+        
+        # Erase the RULER / MOVE arrow
+        self._vector = None
+
+        self.queueDraw()
 
     # ----------------------------------------------------------------------
     def actionCancel(self, event=None):
@@ -399,6 +1091,7 @@ class CNCCanvas(Canvas):
     # ----------------------------------------------------------------------
     def setActionOrigin(self, event=None):
         self.setAction(ACTION_ORIGIN)
+        self._mouseAction = ACTION_ORIGIN
         self.status(_("Click to set the origin (zero)"))
 
     # ----------------------------------------------------------------------
@@ -409,13 +1102,11 @@ class CNCCanvas(Canvas):
     # ----------------------------------------------------------------------
     def setActionGantry(self, event=None):
         self.setAction(ACTION_GANTRY)
-        self.config(background="seashell")
         self.status(_("Move CNC gantry to mouse location"))
 
     # ----------------------------------------------------------------------
     def setActionWPOS(self, event=None):
         self.setAction(ACTION_WPOS)
-        self.config(background="ivory")
         self.status(
             _("Set mouse location as current machine position (X/Y only)"))
 
@@ -455,41 +1146,57 @@ class CNCCanvas(Canvas):
             return -0.5 * (u / S60 + v / C60), -0.5 * (u / S60 - v / C60), None
 
     # ----------------------------------------------------------------------
-    # Image (pixel) coordinates to machine
-    # ----------------------------------------------------------------------
-    def image2Machine(self, x, y):
-        return self.canvas2Machine(self.canvasx(x), self.canvasy(y))
-
-    # ----------------------------------------------------------------------
     # Move gantry to mouse location
     # ----------------------------------------------------------------------
     def actionGantry(self, x, y):
-        u, v, w = self.image2Machine(x, y)
-        self.app.goto(u, v, w)
+        xy_w = self.canvas2WorldXY(vec2(x, y))
+        
+        if xy_w is not None:
+            self.app.goto(xy_w.x, xy_w.y, 0)
+        else:
+            self.status(
+                _("ERROR: Cannot set Gantry location with the current view (Too parallel to the XY plane)"))
+        
         self.setAction(ACTION_SELECT)
 
     # ----------------------------------------------------------------------
     # Set the work coordinates to mouse location
     # ----------------------------------------------------------------------
     def actionWPOS(self, x, y):
-        u, v, w = self.image2Machine(x, y)
-        self.app.mcontrol._wcsSet(u, v, w)
+        xy_w = self.canvas2WorldXY(vec2(x, y))
+        
+        if xy_w is not None:
+            self.app.mcontrol._wcsSet(xy_w.x, xy_w.y, 0)
+        else:
+            self.status(
+                _("ERROR: Cannot set WPOS with the current view (Too parallel to the XY plane)"))
+        
         self.setAction(ACTION_SELECT)
 
     # ----------------------------------------------------------------------
     # Add an orientation marker at mouse location
     # ----------------------------------------------------------------------
     def actionAddOrient(self, x, y):
-        cx, cy = self.snapPoint(self.canvasx(x), self.canvasy(y))
-        u, v, w = self.canvas2Machine(cx, cy)
-        if u is None or v is None:
+        clickedPoint = self.snapPoint(vec2(x, y))
+        
+        # Proyect the canvas cx, cy point to the world xy plane
+        if clickedPoint is None:
+            uv = self.canvas2WorldXY(vec2(x, y))
+        else:
+            uv = vec2(clickedPoint.x, clickedPoint.y)
+
+        if uv is None:
             self.status(
-                _("ERROR: Cannot set X-Y marker  with the current view"))
+                _("ERROR: Cannot set X-Y marker with the current view (Too parallel to the XY plane)"))
             return
+        
         self._orientSelected = len(self.gcode.orient)
-        self.gcode.orient.add(CNC.vars["wx"], CNC.vars["wy"], u, v)
+        self.gcode.orient.add(CNC.vars["wx"], CNC.vars["wy"], uv.x, uv.y)
         self.event_generate("<<OrientSelect>>", data=self._orientSelected)
         self.setAction(ACTION_SELECT)
+
+        self.status(
+                _("X-Y marker created."))
 
     # ----------------------------------------------------------------------
     # Find item selected
@@ -507,63 +1214,67 @@ class CNCCanvas(Canvas):
             self._mouseAction = ACTION_SELECT_SINGLE
 
         elif self.action in (ACTION_MOVE, ACTION_RULER):
-            i = self.canvasx(event.x)
-            j = self.canvasy(event.y)
-            if self.action == ACTION_RULER and self._vector is not None:
-                # Check if we hit the existing ruler
-                coords = self.coords(self._vector)
-                if abs(coords[0] - i) <= CLOSE_DISTANCE and abs(
-                    coords[1] - j <= CLOSE_DISTANCE
-                ):
-                    # swap coordinates
-                    coords[0], coords[2] = coords[2], coords[0]
-                    coords[1], coords[3] = coords[3], coords[1]
-                    self.coords(self._vector, *coords)
-                    self._vx0, self._vy0, self._vz0 = self.canvas2xyz(
-                        coords[0], coords[1]
-                    )
-                    self._mouseAction = self.action
-                    return
-                elif abs(coords[2] - i) <= CLOSE_DISTANCE and abs(
-                    coords[3] - j <= CLOSE_DISTANCE
-                ):
-                    self._mouseAction = self.action
-                    return
+            i = event.x
+            j = event.y
 
-            if self._vector:
-                self.delete(self._vector)
+            self.vectorDict = {}
+            self.vectorArrowsDict = {}
+
             if self.action == ACTION_MOVE:
                 # Check if we clicked on a selected item
                 try:
                     for item in self.find_overlapping(
-                        i - CLOSE_DISTANCE,
-                        j - CLOSE_DISTANCE,
-                        i + CLOSE_DISTANCE,
-                        j + CLOSE_DISTANCE,
+                        event.x - CLOSE_DISTANCE,
+                        event.y - CLOSE_DISTANCE,
+                        event.x + CLOSE_DISTANCE,
+                        event.y + CLOSE_DISTANCE,
+                        self.pathVertices
                     ):
-                        tags = self.gettags(item)
-                        if (
-                            "sel" in tags
-                            or "sel2" in tags
-                            or "sel3" in tags
-                            or "sel4" in tags
-                        ):
+                        if self.isSelected(item, self.pathVertices):
                             break
                     else:
                         self._mouseAction = ACTION_SELECT_SINGLE
                         return
-                    fill = MOVE_COLOR
+                    # fill = MOVE_COLOR
+                    fill = 'White'
                     arrow = LAST
                 except Exception:
                     self._mouseAction = ACTION_SELECT_SINGLE
                     return
             else:
-                fill = RULER_COLOR
+                # fill = RULER_COLOR
+                fill = 'White'
                 arrow = BOTH
-            self._vector = self.create_line(
-                (i, j, i, j), fill=fill, arrow=arrow)
-            self._vx0, self._vy0, self._vz0 = self.canvas2xyz(i, j)
-            self._mouseAction = self.action
+            
+            self._snapPoint = self.snapPoint(vec2(event.x, event.y))
+
+            if self._snapPoint is None:
+                start = self.canvas2WorldXY(vec2(event.x, event.y), 20)
+                start = vec3(start.x, start.y, 0)
+            else:
+                start = self._snapPoint
+
+            if start is not None:
+                if self.action == ACTION_MOVE:
+                    self._moveFrom = start
+                
+                self._vector = self.create_line(self.vectorDict,
+                                                [[start.x, start.y, start.z], [start.x, start.y, start.z]],
+                                                self.rgb8(fill),
+                                                1.)
+                vectorVertices = self.update_lines_buffer(self.vectorVBO, self.vectorDict)
+
+                # Draw arrows
+                self.set_arrow(self.vectorArrowsDict,
+                                self.vectorArrowsVBO,
+                                vectorVertices,
+                                self._vector,
+                                arrow,
+                                10,
+                                10)
+                
+                self._lastEnd = start
+                self._mouseAction = self.action            
 
         # Move gantry to position
         elif self.action == ACTION_GANTRY:
@@ -579,74 +1290,346 @@ class CNCCanvas(Canvas):
 
         # Set coordinate origin
         elif self.action == ACTION_ORIGIN:
-            i = self.canvasx(event.x)
-            j = self.canvasy(event.y)
-            x, y, z = self.canvas2xyz(i, j)
-            self.app.insertCommand(_("origin {:g} {:g} {:g}").format(x, y, z),
+            self._snapPoint = self.snapPoint(vec2(event.x, event.y))
+
+            if self._snapPoint is None:
+                xy_w = self.canvas2WorldXY(vec2(event.x, event.y))
+            else:
+                xy_w = self._snapPoint
+                
+            if xy_w is not None:
+                self.app.insertCommand(_("origin {:g} {:g} {:g}").format(xy_w.x, xy_w.y, 0),
                                    True)
+            else:
+                self.status(
+                _("ERROR: Cannot set Origin with the current view (Too parallel to the XY plane)"))
+            
             self.setActionSelect()
 
         elif self.action == ACTION_PAN:
             self.pan(event)
+        
+        self.queueDraw()
 
+    def isSelected(self, lineId, lineVertices) -> bool:
+        lines16 = numpy.reshape(lineVertices, (-1, 16))
+        line16 = lines16[lines16[:, 0] == lineId]
+
+        if len(line16) == 0:
+            return False
+        
+        # Flags at item 7 of the line data
+        return (int(line16[0][7]) & FLAG_SELECTED) == FLAG_SELECTED
+
+
+
+    def midClick(self, event):
+        self._x = event.x
+        self._y = event.y
+    
+    def rightClick(self, event):
+        self._x = event.x
+        self._y = event.y
+    
+    def rotate(self, event):
+        if (self._x == event.x and self._y == event.y):
+            return
+        
+        self.configure(cursor=mouseCursor(ACTION_ROTATE))
+
+        RotAxis = normalize(vec4(event.y - self._y, event.x - self._x, 0, 0))
+        
+        RotAxis = inverse(self.MVMatrix) * RotAxis
+
+        # Rotate about the Center of the screen
+        rotationCenter = self.canvas2World(vec2(self.winfo_width() / 2., self.winfo_height() / 2.))
+
+        self.MVMatrix = translate(self.MVMatrix, rotationCenter)
+
+        self.MVMatrix = rotate(self.MVMatrix,
+            0.01 * math.sqrt(pow(event.y - self._y, 2) + math.pow(event.x - self._x, 2)),
+            vec3(RotAxis.x, RotAxis.y, RotAxis.z)) # type: ignore
+
+        self.MVMatrix = translate(self.MVMatrix, -rotationCenter)
+        
+        self._x = event.x
+        self._y = event.y
+        
+        self.cameraPosition()
+        
+        self.queueDraw()
+        
     # ----------------------------------------------------------------------
     # Canvas motion button 1
     # ----------------------------------------------------------------------
     def buttonMotion(self, event):
         if self._mouseAction == ACTION_SELECT_AREA:
-            self.coords(
-                self._select,
-                self.canvasx(self._x),
-                self.canvasy(self._y),
-                self.canvasx(event.x),
-                self.canvasy(event.y),
-            )
+            self.updateSelectionRect(self._x, self._y, event.x, event.y)
 
         elif self._mouseAction in (ACTION_SELECT_SINGLE, ACTION_SELECT_DOUBLE):
             if abs(event.x - self._x) > 4 or abs(event.y - self._y) > 4:
                 self._mouseAction = ACTION_SELECT_AREA
-                self._select = self.create_rectangle(
-                    self.canvasx(self._x),
-                    self.canvasy(self._y),
-                    self.canvasx(event.x),
-                    self.canvasy(event.y),
-                    outline=BOX_SELECT,
-                )
+                self.updateSelectionRect(self._x, self._y, event.x, event.y)
 
-        elif self._mouseAction in (ACTION_MOVE, ACTION_RULER):
-            coords = self.coords(self._vector)
-            i = self.canvasx(event.x)
-            j = self.canvasy(event.y)
-            coords[-2] = i
-            coords[-1] = j
-            self.coords(self._vector, *coords)
-            if self._mouseAction == ACTION_MOVE:
-                self.move("sel", event.x - self._xp, event.y - self._yp)
-                self.move("sel2", event.x - self._xp, event.y - self._yp)
-                self.move("sel3", event.x - self._xp, event.y - self._yp)
-                self.move("sel4", event.x - self._xp, event.y - self._yp)
-                self._xp = event.x
-                self._yp = event.y
+        elif self._mouseAction == ACTION_MOVE or self._mouseAction == ACTION_RULER:
+            if self._vector:
+                # Calculate the end snap point
+                if self._mouseAction == ACTION_MOVE:
+                    self._snapPoint = self.snapPoint(vec2(event.x, event.y), True)
+                else:
+                    self._snapPoint = self.snapPoint(vec2(event.x, event.y))
 
-            self._vx1, self._vy1, self._vz1 = self.canvas2xyz(i, j)
-            dx = self._vx1 - self._vx0
-            dy = self._vy1 - self._vy0
-            dz = self._vz1 - self._vz0
-            self.status(
-                _("dx={:g}  dy={:g}  dz={:g}  length={:g}  angle={:g}").format(
-                    dx,
-                    dy,
-                    dz,
-                    math.sqrt(dx**2 + dy**2 + dz**2),
-                    math.degrees(math.atan2(dy, dx)),
+                # Draw the line to the current cursor point or to the snap point, if found
+                if self._snapPoint is None:
+                    end = self.canvas2WorldXY(vec2(event.x, event.y), 0)
+                    end = vec3(end.x, end.y, 0)
+                else:
+                    end = self._snapPoint
+
+                # Change the _vector line end and update the corresponding opengl buffer
+                self.vectorDict[self._vector][0][1] = [end.x, end.y, end.z]
+                vectorVertices = self.update_lines_buffer(self.vectorVBO, self.vectorDict)
+
+                # Draw arrows
+                if self._mouseAction == ACTION_MOVE:
+                    arrow = 'last'
+                else:
+                    arrow = 'both'
+
+                self.set_arrow(self.vectorArrowsDict,
+                               self.vectorArrowsVBO,
+                               vectorVertices,
+                               self._vector,
+                               arrow,
+                               10,
+                               10)
+
+                if self._mouseAction == ACTION_MOVE:
+                    selectedIds = self.getSelection(self.pathVertices)
+
+                    self.move(self.pathVertices, selectedIds, end - self._lastEnd, self.pathVBO)
+
+                start = vec3(self.vectorDict[self._vector][0][0])
+                v12 = end - start
+
+                self.status(
+                _("dx={:g}  dy={:g}  dz={:g}  length={:g}  angleXY={:g}").format(
+                    v12.x,
+                    v12.y,
+                    v12.z,
+                    distance(start, end),
+                    math.degrees(math.atan2(v12.y, v12.x)),
                 )
             )
+                
+                self._lastEnd = end
+
+                self.queueDraw()
 
         elif self._mouseAction == ACTION_PAN:
             self.pan(event)
 
         self.setMouseStatus(event)
 
+        self.queueDraw()
+    
+    def move(self, linesVertices, lineIds, translation : vec3, bufferToUpdate = None):
+        lines16 = numpy.reshape(linesVertices, (-1, 16))
+        mask = numpy.isin(lines16[:, 0], lineIds)
+
+        lines16[mask, 1:4] += translation
+        lines16[mask, 9:12] += translation
+
+        if bufferToUpdate:
+            glBindBuffer(GL_ARRAY_BUFFER, bufferToUpdate)
+            glBufferSubData(GL_ARRAY_BUFFER, 0, linesVertices.nbytes, linesVertices)
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
+            self.queueDraw()
+
+    def find_overlapping(self, x1, y1, x2, y2, lines):
+        # Unit coordinates of the selection area boundaries
+        xy1 = self.canvas2Unit(vec2(x1, y1))
+        xy2 = self.canvas2Unit(vec2(x2, y2))
+
+        xmin = min(xy1.x, xy2.x)
+        xmax = max(xy1.x, xy2.x)
+        ymin = min(xy1.y, xy2.y)
+        ymax = max(xy1.y, xy2.y)
+        
+        # lines is a numpy array containing data for n lines
+        # It has a size of 16·n, dtype=float32
+        # It contains alternatively the starting and end point of a line in World coordinates.
+        # A point is defined with 8 float32 numbers
+        
+        points = (numpy.reshape(lines, (-1, 8))[:, 1:4]).reshape((-1, 3))# x,y,z
+        additionalColumn = numpy.ones((points.shape[0], 1), dtype=numpy.float32)
+        
+        points = numpy.hstack((points, additionalColumn)).reshape((-1, 4))
+
+        # Change world coordinates of the line points to canvas unit coords
+        MVP = numpy.array(self.PMatrix * self.MVMatrix)
+        
+        pointsCanvasUnit = (MVP @ points.T).T
+        
+        # Keep just x and y. Reshape to have starting and end point of each line in the same row
+        linesCanvasUnit = pointsCanvasUnit[:, :2].reshape((-1, 4))
+
+        dx = linesCanvasUnit[:, 2] - linesCanvasUnit[:, 0]
+        dy = linesCanvasUnit[:, 3] - linesCanvasUnit[:, 1]
+
+        p = numpy.stack([-dx, dx, -dy, dy], axis=1)  # shape (N, 4)
+        q = numpy.stack([linesCanvasUnit[:, 0] - xmin, xmax - linesCanvasUnit[:, 0],
+                    linesCanvasUnit[:, 1] - ymin, ymax - linesCanvasUnit[:, 1]], axis=1)
+
+        with numpy.errstate(divide='ignore', invalid='ignore'):
+            r = q / p  # shape (N, 4)
+
+        # Identify conditions
+        mask_neg = p < 0
+        mask_pos = p > 0
+        mask_zero_and_q_neg = (p == 0) & (q < 0)
+        any_outside = numpy.any(mask_zero_and_q_neg, axis=1)
+
+        # Initialize u1 and u2
+        u1 = numpy.where(mask_neg, r, 0.0)
+        u2 = numpy.where(mask_pos, r, 1.0)
+
+        u1_max = numpy.max(u1, axis=1)
+        u2_min = numpy.min(u2, axis=1)
+
+        intersects = (u1_max <= u2_min) & ~any_outside
+        
+        # Get the ids of the overlapped lines (id is the 1st parameter of the lines array)
+        lineIds = lines.reshape((-1, 16))[:, 0]
+        
+        selectedIds = numpy.unique(lineIds[intersects]).tolist()
+        
+        return selectedIds
+        
+    def find_enclosed(self, x1, y1, x2, y2, lines):
+        # Unit coordinates of the selection area boundaries
+        xy1 = self.canvas2Unit(vec2(x1, y1))
+        xy2 = self.canvas2Unit(vec2(x2, y2))
+
+        xmin = min(xy1.x, xy2.x)
+        xmax = max(xy1.x, xy2.x)
+        ymin = min(xy1.y, xy2.y)
+        ymax = max(xy1.y, xy2.y)
+        
+        # lines is a numpy array containing data for n lines
+        # It has a size of 16·n, dtype=float32
+        # It contains alternatively the starting and end point of a line in World coordinates.
+        # A point is defined with 8 float32 numbers
+        
+        points = (numpy.reshape(lines, (-1, 8))[:, 1:4]).reshape((-1, 3))# x,y,z
+        additionalColumn = numpy.ones((points.shape[0], 1), dtype=numpy.float32)
+        
+        points = numpy.hstack((points, additionalColumn)).reshape((-1, 4))
+
+        # Change world coordinates of the line points to canvas unit coords
+        MVP = numpy.array(self.PMatrix * self.MVMatrix)
+        
+        pointsCanvasUnit = (MVP @ points.T).T
+        
+        # Keep just x and y. Reshape to have starting and end point of each line in the same row
+        linesCanvasUnit = pointsCanvasUnit[:, :2].reshape((-1, 4))
+
+        # Boolean mask for both endpoints inside
+        mask = (
+            (linesCanvasUnit[:, 0] >= xmin) & (linesCanvasUnit[:, 0] <= xmax) &
+            (linesCanvasUnit[:, 1] >= ymin) & (linesCanvasUnit[:, 1] <= ymax) &
+            (linesCanvasUnit[:, 2] >= xmin) & (linesCanvasUnit[:, 2] <= xmax) &
+            (linesCanvasUnit[:, 3] >= ymin) & (linesCanvasUnit[:, 3] <= ymax)
+        )
+
+        lines_16 = numpy.reshape(lines, (-1, 16))[:, 0]
+        
+        return numpy.unique(lines_16[mask]).tolist() 
+    
+    def find_closest(self, x, y, lines, tolerance, returnIndex = False, excludeSelected = False):
+        # Unit coordinates of the selection area boundaries
+        xy = self.canvas2Unit(vec2(x, y))
+
+        # tolerance in unit distance
+        unitTolX = tolerance / self.winfo_width() * 2
+        unitTolY = tolerance / self.winfo_height() * 2
+        
+        xmin = xy.x - unitTolX
+        xmax = xy.x + unitTolX
+        ymin = xy.y - unitTolY
+        ymax = xy.y + unitTolY
+        
+        # lines is a numpy array containing data for n lines
+        # It has a size of 16·n, dtype=float32
+        # It contains alternatively the starting and end point of a line in World coordinates.
+        # A point is defined with 8 float32 numbers
+        
+        points = (numpy.reshape(lines, (-1, 8))[:, 1:4]).reshape((-1, 3))# x,y,z
+        additionalColumn = numpy.ones((points.shape[0], 1), dtype=numpy.float32)
+        
+        points = numpy.hstack((points, additionalColumn)).reshape((-1, 4))
+
+        # Change world coordinates of the line points to canvas unit coords
+        MVP = numpy.array(self.PMatrix * self.MVMatrix)
+        
+        pointsCanvasUnit = (MVP @ points.T).T
+        
+        # Keep just x and y. Reshape to have starting and end point of each line in the same row
+        linesCanvasUnit = pointsCanvasUnit[:, :2].reshape((-1, 4))
+
+        dx = linesCanvasUnit[:, 2] - linesCanvasUnit[:, 0]
+        dy = linesCanvasUnit[:, 3] - linesCanvasUnit[:, 1]
+
+        p = numpy.stack([-dx, dx, -dy, dy], axis=1)  # shape (N, 4)
+        q = numpy.stack([linesCanvasUnit[:, 0] - xmin, xmax - linesCanvasUnit[:, 0],
+                    linesCanvasUnit[:, 1] - ymin, ymax - linesCanvasUnit[:, 1]], axis=1)
+
+        with numpy.errstate(divide='ignore', invalid='ignore'):
+            r = q / p  # shape (N, 4)
+
+        # Identify conditions
+        mask_neg = p < 0
+        mask_pos = p > 0
+        mask_zero_and_q_neg = (p == 0) & (q < 0)
+        any_outside = numpy.any(mask_zero_and_q_neg, axis=1)
+
+        # Initialize u1 and u2
+        u1 = numpy.where(mask_neg, r, 0.0)
+        u2 = numpy.where(mask_pos, r, 1.0)
+
+        u1_max = numpy.max(u1, axis=1)
+        u2_min = numpy.min(u2, axis=1)
+
+        intersects = (u1_max <= u2_min) & ~any_outside
+
+        if excludeSelected:
+            lines16 = numpy.reshape(lines, (-1, 16))
+            selection_mask = (lines16[:, 7].astype(int) & FLAG_SELECTED) == FLAG_SELECTED
+            intersects = intersects & ~selection_mask
+        
+        # TODO: Return the closest one, not the first in the list...
+
+        # If returnIndex is True, return the index of the closest line in the lines array, instead of the closest line ID
+        if returnIndex:
+            indices = numpy.arange(lines.size / 16)
+            selectedIndices = indices[intersects].tolist()
+
+            if len(selectedIndices) == 0:
+                return []
+            else:
+                return [selectedIndices[0]]
+            
+        else:
+            # Get the ids of the overlapped lines (id is the 1st parameter of the lines array)
+            lineIds = lines.reshape((-1, 16))[:, 0]
+            
+            selectedIds = numpy.unique(lineIds[intersects]).tolist()
+            
+            if len(selectedIds) == 0:
+                return []
+            else:
+                return [selectedIds[0]]
+    
     # ----------------------------------------------------------------------
     # Canvas release button1. Select area
     # ----------------------------------------------------------------------
@@ -656,23 +1639,33 @@ class CNCCanvas(Canvas):
             ACTION_SELECT_DOUBLE,
             ACTION_SELECT_AREA,
         ):
+            closest = numpy.array([])
+            
             if self._mouseAction == ACTION_SELECT_AREA:
                 if self._x < event.x:  # From left->right enclosed
-                    closest = self.find_enclosed(
-                        self.canvasx(self._x),
-                        self.canvasy(self._y),
-                        self.canvasx(event.x),
-                        self.canvasy(event.y),
-                    )
+                    try:
+                        closest = self.find_enclosed(
+                            self._x,
+                            self._y,
+                            event.x,
+                            event.y,
+                            self.pathVertices
+                        )
+                    except Exception:
+                        pass
+
                 else:  # From right->left overlapping
-                    closest = self.find_overlapping(
-                        self.canvasx(self._x),
-                        self.canvasy(self._y),
-                        self.canvasx(event.x),
-                        self.canvasy(event.y),
-                    )
-                self.delete(self._select)
-                self._select = None
+                    try:
+                        closest = self.find_overlapping(
+                            self._x,
+                            self._y,
+                            event.x,
+                            event.y,
+                            self.pathVertices
+                        )
+                    except Exception:
+                        pass
+
                 items = []
                 for i in closest:
                     try:
@@ -682,43 +1675,50 @@ class CNCCanvas(Canvas):
 
             elif self._mouseAction in (ACTION_SELECT_SINGLE,
                                        ACTION_SELECT_DOUBLE):
-                closest = self.find_closest(
-                    self.canvasx(event.x),
-                    self.canvasy(event.y),
-                    CLOSE_DISTANCE
-                )
+                try:
+                    closest = self.find_closest(
+                        event.x,
+                        event.y,
+                        self.pathVertices,
+                        CLOSE_DISTANCE
+                    )
+                except Exception:
+                    pass
+
                 items = []
                 for i in closest:
                     try:
                         items.append(self._items[i])
                     except KeyError:
+                        #  TODO: Implement
                         tags = self.gettags(i)
                         if "Orient" in tags:
                             self.selectMarker(i)
                             return
                         pass
-            if not items:
-                return
+            if items:
+                self.app.select(
+                    items,
+                    self._mouseAction == ACTION_SELECT_DOUBLE,
+                    event.state & CONTROL_MASK == 0,
+                )
 
-            self.app.select(
-                items,
-                self._mouseAction == ACTION_SELECT_DOUBLE,
-                event.state & CONTROL_MASK == 0,
-            )
             self._mouseAction = None
+            self.queueDraw()
 
         elif self._mouseAction == ACTION_MOVE:
-            i = self.canvasx(event.x)
-            j = self.canvasy(event.y)
-            self._vx1, self._vy1, self._vz1 = self.canvas2xyz(i, j)
-            dx = self._vx1 - self._vx0
-            dy = self._vy1 - self._vy0
-            dz = self._vz1 - self._vz0
-            self.status(_("Move by {:g}, {:g}, {:g}").format(dx, dy, dz))
-            self.app.insertCommand(("move %g %g %g") % (dx, dy, dz), True)
+            moveFrom = vec3(self.vectorDict[self._vector][0][0])
+            moveTo = self._lastEnd
+            translation = moveTo - moveFrom
+
+            self.status(_("Move by {:g}, {:g}, {:g}").format(translation.x, translation.y, translation.z))
+            self.app.insertCommand(("move %g %g %g") % (translation.x, translation.y, translation.z), True)
+        
+        elif self._mouseAction == ACTION_RULER:
+            self._snapPoint = None
 
         elif self._mouseAction == ACTION_PAN:
-            self.panRelease(event)
+            self.midRelease(event)
 
     # ----------------------------------------------------------------------
     def double(self, event):
@@ -726,117 +1726,324 @@ class CNCCanvas(Canvas):
 
     # ----------------------------------------------------------------------
     def motion(self, event):
+        if self.action == ACTION_ADDORIENT:
+            self._snapPoint = self.snapPoint(vec2(event.x, event.y))
+            # Project to the XY plane
+            if self._snapPoint is not None:
+                self._snapPoint.z = 0
+
+            self.queueDraw()
+
+        elif self.action == ACTION_MOVE or self.action == ACTION_RULER:
+            self._snapPoint = self.snapPoint(vec2(event.x, event.y))
+
+            self.queueDraw()
+        
+        elif self._mouseAction == ACTION_ORIGIN:
+            self._snapPoint = self.snapPoint(vec2(event.x, event.y))
+
+            self.queueDraw()
+
+
         self.setMouseStatus(event)
 
-    # -----------------------------------------------------------------------
-    # Testing routine
-    # -----------------------------------------------------------------------
-    def __test(self, event):
-        i = self.canvasx(event.x)
-        j = self.canvasy(event.y)
-        x, y, z = self.canvas2xyz(i, j)
+    def get_ends_and_center(self, lines, id):
+        # lines is an array with lines vertex data as self.pathLines
+        
+        # Reshape to have one line per row. Each row has the info of the 2 vertices (location, ...)
+        lines16 = numpy.reshape(lines, (-1, 16))
+
+        # Filter the lines with id. If there is more than one, it is an arc composed by multiple lines
+        line16 = lines16[lines16[:, 0] == id]
+
+        if len(line16) == 0:
+            return None, None, None
+        
+        elif len(line16) == 1: # Just one row. We picked on a line
+            return vec3(line16[0, 1:4]), vec3(line16[0, 9:12]), None
+        
+        else: # Multiple rows. We picked on an arc. We return the first point of the first line and the last point of the last line
+            p_start = vec3(line16[0, 1:4])
+            p_end = vec3(line16[-1, 9:12])
+            
+            # If it's a closed arc (a circle), pick the starting point of the last line, instead of the end point
+            if distance(p_start, p_end) == 0.:
+                p_end = vec3(line16[-1, 1:4])
+            
+            numlines = len(line16)
+            p_mid = vec3(line16[int(numpy.ceil(numlines / 2.)), 1:4])
+            
+            # Compute the arc center
+            SM = p_mid - p_start
+            SE = p_end - p_start
+
+            cross_prod = cross(SM, SE)
+            denom = 2.0 * length2(cross_prod)
+
+            if denom == 0:
+                p_center = None # Points are collinear
+            else:
+                term1 = cross(cross_prod, SM) * length2(SE)
+                term2 = cross(SE, cross_prod) * length2(SM)
+
+                p_center = p_start + (term1 + term2) / denom
+                
+            return p_start, p_end, p_center
 
     # ----------------------------------------------------------------------
     # Snap to the closest point if any
     # ----------------------------------------------------------------------
-    def snapPoint(self, cx, cy):
-        xs, ys = None, None
-        if CNC.inch:
-            dmin = (self.zoom / 25.4) ** 2  # 1mm maximum distance ...
-        else:
-            dmin = (self.zoom) ** 2
-        dmin = (CLOSE_DISTANCE * self.zoom) ** 2
+    def snapPoint(self, clickPoint: vec2, excludeSelected = False) -> vec3 | None:
+        """
+        When clicking on the canvas at point clickPoint, return the world coordinates of a close path point, or none
+        """
+        snapPoint = None
 
-        # ... and if we are closer than 5pixels
-        for item in self.find_closest(cx, cy, CLOSE_DISTANCE):
-            try:
-                bid, lid = self._items[item]
-            except KeyError:
-                continue
+        item = self.find_closest(clickPoint.x, clickPoint.y, self.pathVertices, CLOSE_DISTANCE, excludeSelected=excludeSelected)
 
-            # Very cheap and inaccurate approach :)
-            coords = self.coords(item)
-            x = coords[0]  # first
-            y = coords[1]  # point
-            d = (cx - x) ** 2 + (cy - y) ** 2
-            if d < dmin:
-                dmin = d
-                xs, ys = x, y
-
-            x = coords[-2]  # last
-            y = coords[-1]  # point
-            d = (cx - x) ** 2 + (cy - y) ** 2
-            if d < dmin:
-                dmin = d
-                xs, ys = x, y
-
-            # I need to check the real code and if
-            # an arc check also the center?
-
-        if xs is not None:
-            return xs, ys
-        else:
-            return cx, cy
-
-    # ----------------------------------------------------------------------
-    # Get margins of selected items
-    # ----------------------------------------------------------------------
-    def getMargins(self):
-        bbox = self.bbox("sel")
-        if not bbox:
+        if len(item) == 0:
             return None
-        x1, y1, x2, y2 = bbox
-        dx = (x2 - x1 - 1) / self.zoom
-        dy = (y2 - y1 - 1) / self.zoom
-        return dx, dy
+        
+        # Get the ends of the closest line, in canvas coordinates
+        start, end, center = self.get_ends_and_center(self.pathVertices, item)
 
-    # ----------------------------------------------------------------------
-    def xview(self, *args):
-        ret = Canvas.xview(self, *args)
-        if args:
-            self.cameraPosition()
-        return ret
+        if start is None or end is None:
+            return None
 
-    # ----------------------------------------------------------------------
-    def yview(self, *args):
-        ret = Canvas.yview(self, *args)
-        if args:
-            self.cameraPosition()
-        return ret
+        start_c = self.world2Canvas(start)
+        end_c = self.world2Canvas(end)
+
+        dist_start = distance(clickPoint, start_c)
+        dist_end = distance(clickPoint, end_c)
+
+        if dist_start < dist_end and dist_start < CLOSE_DISTANCE:
+            return start
+        elif dist_end < dist_start and dist_end < CLOSE_DISTANCE:
+            return end
+        elif center is not None: # We clicked on an arc, far from the ends. Return the center point
+            return center
+        else:
+            return None
 
     # ----------------------------------------------------------------------
     def configureEvent(self, event):
+        width = self.winfo_width()
+        height = self.winfo_height()
+        
+        self.PMatrix = ortho(-width / 2.0 / self.zoom, 
+                             width / 2.0 / self.zoom, 
+                             -height / 2.0 / self.zoom,
+                             height / 2.0 / self.zoom, 
+                             -10000,
+                             10000)
         self.cameraPosition()
+        self.queueDraw()
+
+    def closest_points_between_lines(self, P1, P2, Q1, Q2, eps=1e-9):
+        """
+        Compute closest points between two infinite 3D lines.
+
+        Line 1: P1 + t*(P2-P1)
+        Line 2: Q1 + u*(Q2-Q1)
+
+        Returns:
+            C1 : closest point on line 1
+            C2 : closest point on line 2
+            distance : minimum distance between lines
+            intersect : True if lines intersect (within tolerance)
+        """
+
+        r = P2 - P1
+        s = Q2 - Q1
+        w0 = P1 - Q1
+
+        a = dot(r, r)
+        b = dot(r, s)
+        c = dot(s, s)
+        d = dot(r, w0)
+        e = dot(s, w0)
+
+        denom = a * c - b * b
+
+        # If denom is zero, lines are parallel
+        if abs(denom) < eps:
+            # choose arbitrary t = 0
+            t = 0.0
+            u = e / c if c > eps else 0.0
+        else:
+            t = (b * e - c * d) / denom
+            u = (a * e - b * d) / denom
+
+        C1 = P1 + t * r
+        C2 = Q1 + u * s
+
+        dist = distance(C1, C2)
+        intersect = dist < eps
+
+        return C1, C2, dist, intersect
+
+    def blue2red(self, v: float, vmin: float, vmax: float) -> vec3:
+        """
+        Return an interpolated RGB tuple, based on the value v between vmin and vmax
+        v==vmin -> blue
+        v==vmax -> red
+        """
+        if vmax <= vmin or v < vmin or v > vmax:
+            return vec3(0, 0, 0)  # fallback
+    
+        t = (v - vmin) / (vmax - vmin)
+        t = max(0, min(1, t))
+
+        R = int(255 * t)
+        G = 0
+        B = int(255 * (1 - t))
+
+        return vec3(R, G, B)
 
     # ----------------------------------------------------------------------
     def pan(self, event):
-        if self._mouseAction == ACTION_PAN:
-            self.scan_dragto(event.x, event.y, gain=1)
-            self.cameraPosition()
-
-        else:
-            self.config(cursor=mouseCursor(ACTION_PAN))
-            self.scan_mark(event.x, event.y)
+        if self._mouseAction != ACTION_PAN:
+            self.configure(cursor=mouseCursor(ACTION_PAN))
             self._mouseAction = ACTION_PAN
+            
+        self.pan_delta(event.x - self._x, event.y - self._y)
+        
+        self._x = event.x
+        self._y = event.y
 
+    def pan_delta(self, deltaX, deltaY):
+        # Pan a number of pixels in X and/or Y
+        width = self.winfo_width()
+        height = self.winfo_height()
+        
+        MVPinv = inverse(self.PMatrix * self.MVMatrix)
+        
+        pointFrom = MVPinv * vec4(-1, 1, 0, 1) # Screen (0, 0)
+        pointTo = MVPinv * vec4(2 * (deltaX - width / 2.0) / width, 2 * (height / 2.0 - deltaY) / height, 0, 1) # Screen (deltaX, deltaY)
+
+        self.MVMatrix = translate(self.MVMatrix, vec3((pointTo - pointFrom).x, (pointTo - pointFrom).y, (pointTo - pointFrom).z)) # type: ignore
+        
+        self.cameraPosition()
+        
+        self.queueDraw()
     # ----------------------------------------------------------------------
-    def panRelease(self, event):
+    def midRelease(self, event):
+        # If there was no pan (just mid-click), and the user clicked on a path, 
+        # change the rotation center to the closest point of that line to the point where the user clicked
+        if self._mouseAction != ACTION_PAN:
+            lineIndex = self.find_closest(self._x, self._y, self.pathVertices, CLOSE_DISTANCE, returnIndex=True)
+            
+            if lineIndex is not None:
+                line = self.pathVertices.reshape((-1, 16))[int(lineIndex[0])]
+                lineStart = vec3(line[1:4])
+                lineEnd = vec3(line[9:12])
+
+                MVPinv = inverse(self.PMatrix * self.MVMatrix)
+
+                pickPoint = self.canvas2Unit(vec2(event.x, event.y))
+
+                # pickLine is a line perpendicular to the screen
+                pickLineStart =  vec3(MVPinv * vec4(pickPoint.x, pickPoint.y, 0, 1))
+                pickLineEnd = vec3(MVPinv * vec4(pickPoint.x, pickPoint.y, -1, 1))
+
+                # If pickLine does not exactly intersect line, we get 2 points:
+                # C1: closest point at pickLine
+                # C2: closest point at line
+                C1, C2, dist, intersect = self.closest_points_between_lines(pickLineStart, pickLineEnd, lineStart, lineEnd)
+
+                # Translate the MV Matrix, so that the clicked point moves to the screen center
+                RS = mat3x3(self.MVMatrix)
+                new_translation = -RS * C2
+                self.MVMatrix[3] = vec4(new_translation, 1)
+
+                self.queueDraw()
+
         self._mouseAction = None
-        self.config(cursor=mouseCursor(self.action))
+        self.configure(cursor=mouseCursor(self.action))
+
+    def rightRelease(self, event):
+        self.configure(cursor=mouseCursor(self.action))
 
     # ----------------------------------------------------------------------
     def panLeft(self, event=None):
-        self.xview(SCROLL, -1, UNITS)
+        self.pan_delta(15, 0) # 15 pixels, as in the original canvas
 
     def panRight(self, event=None):
-        self.xview(SCROLL, 1, UNITS)
+        self.pan_delta(-15, 0)
 
     def panUp(self, event=None):
-        self.yview(SCROLL, -1, UNITS)
+        self.pan_delta(0, 15)
 
     def panDown(self, event=None):
-        self.yview(SCROLL, 1, UNITS)
+        self.pan_delta(0, -15)
 
+    def canvas2Unit(self, coords : vec2) -> vec2:
+        # Map screen pixel coordinates to opengl screen coords [-1.0 -> 1.0]
+        # In OpenGL, y goes positive upwards
+        width = self.winfo_width()
+        height = self.winfo_height()
+        
+        return vec2(
+            coords.x / (width / 2.0) - 1,
+            1 - coords.y / (height / 2.0)
+        )
+    
+    def unit2Canvas(self, coords : vec2) -> vec2:
+        # Map opengl screen coords [-1.0 -> 1.0] to screen pixel coordinates
+        # In OpenGL, y goes positive upwards
+        width = self.winfo_width()
+        height = self.winfo_height()
+        
+        return vec2(
+            (coords.x + 1.) * (width / 2.),
+            (1 - coords.y) * (height / 2.)
+        )
+    
+    def world2Canvas(self, coords : vec3) -> vec2:
+        MVP = self.PMatrix * self.MVMatrix
+        unitCoords = (MVP * vec4(coords, 1)).xy
+
+        return self.unit2Canvas(unitCoords)
+
+    def canvas2World(self, coords : vec2) -> vec3:
+        coordsUnit = self.canvas2Unit(coords)
+        
+        MVPinv = inverse(self.PMatrix * self.MVMatrix)
+        
+        return (MVPinv * vec4(coordsUnit, 0, 1)).xyz
+    
+    def canvas2WorldXY(self, coords : vec2, thresholdAngle = 20) -> vec2 | None:
+        intersection = self.canvas2WorldPlane(coords, vec3(0, 0, 1), vec3(0, 0, 0), thresholdAngle)
+        if intersection == None:
+            return None
+        else:
+            return vec2(intersection.x, intersection.y)
+    
+    def canvas2WorldPlane(self, coords: vec2, planeNormal : vec3, planePoint : vec3, thresholdAngle = 20) -> vec3 | None:
+        # return the point of the plane where we picked on the canvas, in world coordinates
+        # If the plane is too parallel to the screen (less than thresholdAngle), return None
+        coords_u = self.canvas2Unit(coords)
+
+        MVPinv = inverse(self.PMatrix * self.MVMatrix)
+
+        # We define a line perpendicular to the canvas
+        p1 = (MVPinv * vec4(coords_u, 0, 1)).xyz
+        p2 = (MVPinv * vec4(coords_u, 1, 1)).xyz
+        
+        v12 = p2 - p1
+
+        # If we are too parallel to the plane, return None
+        angle = 90 - numpy.rad2deg(numpy.acos(abs(dot(normalize(v12), planeNormal))))
+        if angle < thresholdAngle:
+            return None
+
+        n = normalize(planeNormal)
+        denom = dot(n, v12)
+        t = dot(n, planePoint - p1) / denom
+
+        intersection = p1 + v12 * t
+
+        return intersection
     # ----------------------------------------------------------------------
     # Delay zooming to cascade multiple zoom actions
     # ----------------------------------------------------------------------
@@ -856,37 +2063,37 @@ class CNCCanvas(Canvas):
 
         self.__tzoom = 1.0
 
+        width = self.winfo_width()
+        height = self.winfo_height()     
+        
+        MVP = self.PMatrix * self.MVMatrix          
+        
+        # We zoom around the (x, y) screen location 
+        zoomOrigin3d = self.canvas2World(vec2(x, y))
+        
+        screenCenter3d = (inverse(MVP) * vec4(0, 0, 0, 1)).xyz
+        
+        # Vector from zoom origin to projected center
+        vZoomOriginToCenter = screenCenter3d - zoomOrigin3d
+        
+        # Translate the model, so that the origin keeps fixed when zooming
+        self.MVMatrix = translate(self.MVMatrix, vZoomOriginToCenter * (1- 1/zoom))
+        
+
+        # Zoom around the mouse location
+        
         self.zoom *= zoom
+        
+        self.PMatrix = ortho(-width / 2.0 / self.zoom, 
+                             width / 2.0 / self.zoom, 
+                             -height / 2.0 / self.zoom,
+                             height / 2.0 / self.zoom, 
+                             -10000,
+                             10000)
+        
+        self.cameraPosition()
 
-        x0 = self.canvasx(0)
-        y0 = self.canvasy(0)
-
-        for i in self.find_all():
-            self.scale(i, 0, 0, zoom, zoom)
-
-        # Update last insert
-        if self._lastGantry:
-            self._drawGantry(*self.plotCoords([self._lastGantry])[0])
-        else:
-            self._drawGantry(0, 0)
-
-        self._updateScrollBars()
-        x0 -= self.canvasx(0)
-        y0 -= self.canvasy(0)
-
-        # Perform pin zoom
-        dx = self.canvasx(x) * (1.0 - zoom)
-        dy = self.canvasy(y) * (1.0 - zoom)
-
-        # Drag to new location to center viewport
-        self.scan_mark(0, 0)
-        self.scan_dragto(int(round(dx - x0)), int(round(dy - y0)), 1)
-
-        # Resize probe image if any
-        if self._probe:
-            self._projectProbeImage()
-            self.itemconfig(self._probe, image=self._probeTkImage)
-        self.cameraUpdate()
+        self.queueDraw()
 
     # ----------------------------------------------------------------------
     # Return selected objects bounding box
@@ -915,104 +2122,44 @@ class CNCCanvas(Canvas):
 
     # New approach by onekk https://github.com/vlachoudis/bCNC/issues/1311
     def fit2Screen(self, event=None):
-        """Zoom to Fit to Screen"""
-
-        bb = self.selBbox()
-        if bb is None:
-            return
-
-        x1, y1, x2, y2 = bb
-
-        # add a factor to improve reability
-        bbox_width = (x2 - x1) * 1.05
-        bbox_height = (y2 - y1) * 1.05
-
-        try:
-            zx = round(float(self.winfo_width() / bbox_width), 2)
-        except Exception:
-            return
-
-        try:
-            zy = round(float(self.winfo_height() / bbox_height), 2)
-        except Exception:
-            return
-
-        if zx > 0.98:
-            self.__tzoom = min(zx, zy)
-        else:
-            self.__tzoom = max(zx, zy)
-
-        self._tx = self._ty = 0
-        self._zoomCanvas()
-
-        # Find position of new selection
-        x1, y1, x2, y2 = self.selBbox()
-        xm = (x1 + x2) // 2
-        ym = (y1 + y2) // 2
-        sx1, sy1, sx2, sy2 = map(float, self.cget("scrollregion").split())
-        midx = float(xm - sx1) / (sx2 - sx1)
-        midy = float(ym - sy1) / (sy2 - sy1)
-
-        a, b = self.xview()
-        d = (b - a) / 2.0
-        self.xview_moveto(midx - d)
-
-        a, b = self.yview()
-        d = (b - a) / 2.0
-        self.yview_moveto(midy - d)
+        """
+        Zoom to Fit to Screen
+        """
+        
+        upVector = inverse(self.MVMatrix) * vec4(0, 1, 0, 0)
+        depthVector = inverse(self.MVMatrix) * vec4(0, 0, 1, 0)
+        
+        self.MVMatrix = lookAt(
+            self._modelCenter + depthVector.xyz, # eye
+            self._modelCenter, # target
+            upVector.xyz # up
+            )
+        # Adjust the Projection Matrix
+        width = self.winfo_width()
+        height = self.winfo_height()
+        
+        self.zoom = min(width, height) / self._modelSize
+        
+        self.PMatrix = ortho(-width / 2.0 / self.zoom, 
+                             width / 2.0 / self.zoom, 
+                             -height / 2.0 / self.zoom,
+                             height / 2.0 / self.zoom, 
+                             -10000,
+                             10000)
 
         self.cameraPosition()
-
-    def fit2Screen_old(self, event=None):
-        bb = self.selBbox()
-        if bb is None:
-            return
-        x1, y1, x2, y2 = bb
-
-        try:
-            zx = float(self.winfo_width()) / (x2 - x1)
-        except Exception:
-            return
-        try:
-            zy = float(self.winfo_height()) / (y2 - y1)
-        except Exception:
-            return
-        if zx > 1.0:
-            self.__tzoom = min(zx, zy)
-        else:
-            self.__tzoom = max(zx, zy)
-
-        self._tx = self._ty = 0
-        self._zoomCanvas()
-
-        # Find position of new selection
-        x1, y1, x2, y2 = self.selBbox()
-        xm = (x1 + x2) // 2
-        ym = (y1 + y2) // 2
-        sx1, sy1, sx2, sy2 = map(float, self.cget("scrollregion").split())
-        midx = float(xm - sx1) / (sx2 - sx1)
-        midy = float(ym - sy1) / (sy2 - sy1)
-
-        a, b = self.xview()
-        d = (b - a) / 2.0
-        self.xview_moveto(midx - d)
-
-        a, b = self.yview()
-        d = (b - a) / 2.0
-        self.yview_moveto(midy - d)
-
-        self.cameraPosition()
+        self.queueDraw()
 
     # ----------------------------------------------------------------------
     def menuZoomIn(self, event=None):
-        x = int(self.cget("width")) // 2
-        y = int(self.cget("height")) // 2
+        x = self.winfo_width() // 2
+        y = self.winfo_height() // 2
         self.zoomCanvas(x, y, 2.0)
 
     # ----------------------------------------------------------------------
     def menuZoomOut(self, event=None):
-        x = int(self.cget("width")) // 2
-        y = int(self.cget("height")) // 2
+        x = self.winfo_width() // 2
+        y = self.winfo_height() // 2
         self.zoomCanvas(x, y, 0.5)
 
     # ----------------------------------------------------------------------
@@ -1041,17 +2188,17 @@ class CNCCanvas(Canvas):
 
         if item is not None and item != self._lastActive:
             if self._lastActive is not None:
-                self.itemconfig(self._lastActive, arrow=NONE)
+                self.set_arrow(self.pathArrows, self.pathArrowsVBO, self.pathVertices, self._lastActive, 'none')
             self._lastActive = item
-            self.itemconfig(self._lastActive, arrow=LAST)
+            self.set_arrow(self.pathArrows, self.pathArrowsVBO, self.pathVertices, self._lastActive, 'last', 10, 10)
 
     # ----------------------------------------------------------------------
     # Display gantry
     # ----------------------------------------------------------------------
     def gantry(self, wx, wy, wz, mx, my, mz):
         self._lastGantry = (wx, wy, wz)
-        self._drawGantry(*self.plotCoords([(wx, wy, wz)])[0])
-        if self._cameraImage and self.cameraAnchor == NONE:
+        self.updateGantry(wx, wy, wz)
+        if self._showCamera and self.cameraAnchor == NONE:
             self.cameraPosition()
 
         dx = wx - mx
@@ -1068,82 +2215,103 @@ class CNCCanvas(Canvas):
 
             if not self.draw_workarea:
                 return
-            xmin = self._dx - CNC.travel_x
-            ymin = self._dy - CNC.travel_y
-            xmax = self._dx
-            ymax = self._dy
-
-            xyz = [
-                (xmin, ymin, 0.0),
-                (xmax, ymin, 0.0),
-                (xmax, ymax, 0.0),
-                (xmin, ymax, 0.0),
-                (xmin, ymin, 0.0),
-            ]
-
-            coords = []
-            for x, y in self.plotCoords(xyz):
-                coords.append(x)
-                coords.append(y)
-            self.coords(self._workarea, *coords)
+            
+            self.updateWorkArea()
 
     # ----------------------------------------------------------------------
     # Clear highlight of selection
     # ----------------------------------------------------------------------
     def clearSelection(self):
         if self._lastActive is not None:
-            self.itemconfig(self._lastActive, arrow=NONE)
+            self.set_arrow(self.pathArrows, self.pathArrowsVBO, self.pathVertices, self._lastActive, 'none')
             self._lastActive = None
-
-        for i in self.find_withtag("sel"):
-            bid, lid = self._items[i]
-            if bid:
-                try:
-                    block = self.gcode[bid]
-                    if block.color:
-                        fill = block.color
-                    else:
-                        fill = ENABLE_COLOR
-                except IndexError:
-                    fill = ENABLE_COLOR
-            else:
-                fill = ENABLE_COLOR
-            self.itemconfig(i, width=1, fill=fill)
-
-        self.itemconfig("sel2", width=1, fill=DISABLE_COLOR)
-        self.itemconfig("sel3", width=1, fill=TAB_COLOR)
-        self.itemconfig("sel4", width=1, fill=DISABLE_COLOR)
-        for i in SELECTION_TAGS:
-            self.dtag(i)
-        self.delete("info")
+        
+        self.deselectAll(self.pathVertices, self.pathVBO)
+         
+        self.deleteInfo()
+        
 
     # ----------------------------------------------------------------------
     # Highlight selected items
     # ----------------------------------------------------------------------
     def select(self, items):
+        linesAndFlags = []
+        
         for b, i in items:
             block = self.gcode[b]
+            flags = FLAG_SELECTED | (FLAG_ENABLED if block.enable else 0)
+            
             if i is None:
-                sel = block.enable and "sel" or "sel2"
                 for path in block._path:
                     if path is not None:
-                        self.addtag_withtag(sel, path)
-                sel = block.enable and "sel3" or "sel4"
+                        linesAndFlags.append([path, flags])
 
             elif isinstance(i, int):
                 path = block.path(i)
                 if path:
-                    sel = block.enable and "sel" or "sel2"
-                    self.addtag_withtag(sel, path)
+                    linesAndFlags.append([path, flags])
+        
+        self.setFlags(self.pathVertices, FLAG_SELECTED | FLAG_ENABLED, linesAndFlags, self.pathVBO)
 
-        self.itemconfig("sel", width=2, fill=SELECT_COLOR)
-        self.itemconfig("sel2", width=2, fill=SELECT2_COLOR)
-        self.itemconfig("sel3", width=2, fill=TAB_COLOR)
-        self.itemconfig("sel4", width=2, fill=TABS_COLOR)
-        for i in SELECTION_TAGS:
-            self.tag_raise(i)
-        self.drawMargin()
+        # Update arrows, if any
+        self.update_arrows_from_lines(self.pathArrows, self.pathArrowsVBO, self.pathVertices)
+                
+        self.updateMargin()
+    
+    def getSelection(self, linesVertices):
+        lines16 = numpy.reshape(linesVertices, (-1, 16))
+        selection = lines16[(lines16[:, 7].astype(int) & FLAG_SELECTED) == FLAG_SELECTED]
+        return numpy.unique(selection[:, 0]).tolist()
 
+
+    def setFlags(self, linesVertices, flagsToModify, linesAndFlags, bufferToUpdate = None):
+        # linesAndTags must be an array of arrays (nx2)
+        # The first item of each array is the line number, and the second item the value with the Tags to be activated
+        selections = numpy.array(linesAndFlags, dtype=numpy.float32).reshape((-1, 2))
+        lookup = dict(selections)
+        
+        linesArray16 = linesVertices.reshape((-1, 16))
+        mask = numpy.isin(linesArray16[:, 0], selections[:, 0])
+        
+        matched_keys = linesArray16[mask, 0]
+        
+        # Since linesArray16 is a reshaped view of linesArray, changes are reflected in the original array
+        # First, clear the bits
+        linesArray16[mask, 7] = linesArray16[mask, 7].astype(int) & ~flagsToModify
+        linesArray16[mask, 15] = linesArray16[mask, 15].astype(int) & ~flagsToModify
+        # Then, set the ones to modify
+        if matched_keys.size > 0:
+            linesArray16[mask, 7] = linesArray16[mask, 7].astype(int) | ((numpy.vectorize(lookup.get)(matched_keys)).astype(int) & flagsToModify)
+            linesArray16[mask, 15] = linesArray16[mask, 15].astype(int) | ((numpy.vectorize(lookup.get)(matched_keys)).astype(int) & flagsToModify)
+        
+            if bufferToUpdate:
+                glBindBuffer(GL_ARRAY_BUFFER, bufferToUpdate)
+                glBufferSubData(GL_ARRAY_BUFFER, 0, linesVertices.nbytes, linesVertices)
+                glBindBuffer(GL_ARRAY_BUFFER, 0)
+                self.queueDraw()
+
+    def deleteLines(self, lines, linesVertices, linesBuffer, updateModelDimensions = False):
+        lines.clear()
+        linesVertices = self.update_lines_buffer(linesBuffer, lines, updateModelDimensions)
+
+        return linesVertices
+    
+    def deleteArrows(self, arrows, arrowsBuffer):
+        arrows.clear()
+        self.update_arrows_buffer(arrowsBuffer, arrows)
+
+    def deselectAll(self, linesArray, bufferToUpdate = None):
+        linesArray16 = linesArray.reshape((-1, 16))
+        
+        linesArray16[:, 7] = linesArray16[:, 7].astype(int) & ~FLAG_SELECTED
+        linesArray16[:, 15] = linesArray16[:, 15].astype(int) & ~FLAG_SELECTED
+        
+        if bufferToUpdate:
+            glBindBuffer(GL_ARRAY_BUFFER, bufferToUpdate)
+            glBufferSubData(GL_ARRAY_BUFFER, 0, linesArray.nbytes, linesArray)
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
+            self.queueDraw()
+    
     # ----------------------------------------------------------------------
     # Select orientation marker
     # ----------------------------------------------------------------------
@@ -1153,31 +2321,49 @@ class CNCCanvas(Canvas):
             if item in paths:
                 self._orientSelected = i
                 for j in paths:
-                    self.itemconfig(j, width=2)
+                    self.orientDict[j][3] = FLAG_ENABLED | FLAG_SELECTED
+                
+                self.update_lines_buffer(self.orientVBO, self.orientDict)
+
                 self.event_generate("<<OrientSelect>>", data=i)
                 return
+            
         self._orientSelected = None
 
     # ----------------------------------------------------------------------
     # Highlight marker that was selected
     # ----------------------------------------------------------------------
     def orientChange(self, marker):
-        self.itemconfig("Orient", width=1)
+        for id in self.orientDict:
+            self.orientDict[id][3] = FLAG_ENABLED
+
         if marker >= 0:
             self._orientSelected = marker
             try:
                 for i in self.gcode.orient.paths[self._orientSelected]:
-                    self.itemconfig(i, width=2)
+                    self.orientDict[i][3] = FLAG_ENABLED | FLAG_SELECTED
+
             except IndexError:
                 self.drawOrient()
         else:
             self._orientSelected = None
+        
+        self.update_lines_buffer(self.orientVBO, self.orientDict)
+
+        self.queueDraw()
 
     # ----------------------------------------------------------------------
     # Display graphical information on selected blocks
     # ----------------------------------------------------------------------
     def showInfo(self, blocks):
-        self.delete("info")  # clear any previous information
+        # Clear any previous information
+        self.infoLines = {}
+
+        self.deleteArrows(self.infoArrows, self.infoArrowsVBO)
+
+
+        infoArcs = []
+
         for bid in blocks:
             block = self.gcode.blocks[bid]
             xyz = [
@@ -1187,7 +2373,12 @@ class CNCCanvas(Canvas):
                 (block.xmin, block.ymax, 0.0),
                 (block.xmin, block.ymin, 0.0),
             ]
-            self.create_line(self.plotCoords(xyz), fill=INFO_COLOR, tag="info")
+
+            self.create_line(self.infoLines,
+                             xyz,
+                             self.rgb8(INFO_COLOR),
+                             1)
+            
             xc = (block.xmin + block.xmax) / 2.0
             yc = (block.ymin + block.ymax) / 2.0
             r = min(block.xmax - xc, block.ymax - yc)
@@ -1220,14 +2411,23 @@ class CNCCanvas(Canvas):
                     (xc + r * math.sin(f), yc + r * math.cos(f), 0.0)
                 )  # towards up
                 f += df
-            self.create_line(
-                self.plotCoords(xyz),
-                fill=INFO_COLOR,
-                width=5,
-                arrow=LAST,
-                arrowshape=(32, 40, 12),
-                tag="info",
-            )
+
+            infoArcs.append(self.create_line(
+                self.infoLines,
+                xyz,
+                self.rgb8(INFO_COLOR),
+                1
+            ))
+        
+        self.infoVertices = self.update_lines_buffer(self.infoVBO, self.infoLines)
+
+        for arc in infoArcs:
+            self.set_arrow(self.infoArrows, self.infoArrowsVBO, self.infoVertices, arc, 'last', 20, 20)
+
+        self.queueDraw()
+    
+    def deleteInfo(self):
+        self.showInfo([])
 
     # -----------------------------------------------------------------------
     def cameraOn(self, event=None):
@@ -1237,13 +2437,8 @@ class CNCCanvas(Canvas):
 
     # -----------------------------------------------------------------------
     def cameraOff(self, event=None):
-        self.delete(self._cameraImage)
-        self.delete(self._cameraHori)
-        self.delete(self._cameraVert)
-        self.delete(self._cameraCircle)
-        self.delete(self._cameraCircle2)
+        self._showCamera = False
 
-        self._cameraImage = None
         if self._cameraAfter:
             self.after_cancel(self._cameraAfter)
             self._cameraAfter = None
@@ -1269,33 +2464,30 @@ class CNCCanvas(Canvas):
         self.camera.ycenter = self.cameraYCenter
         if self.cameraEdge:
             self.camera.canny(50, 200)
-        if self.cameraAnchor == NONE or self.zoom / self.cameraScale > 1.0:
-            self.camera.resize(
-                self.zoom / self.cameraScale,
-                self._cameraMaxWidth,
-                self._cameraMaxHeight,
-            )
-        if self._cameraImage is None:
-            self._cameraImage = self.create_image((0, 0), tag="CameraImage")
-            self.lower(self._cameraImage)
-            # create cross hair at dummy location we will correct latter
-            self._cameraHori = self.create_line(
-                0, 0, 1, 0, fill=CAMERA_COLOR, tag="CrossHair"
-            )
-            self._cameraVert = self.create_line(
-                0, 0, 0, 1, fill=CAMERA_COLOR, tag="CrossHair"
-            )
-            self._cameraCircle = self.create_oval(
-                0, 0, 1, 1, outline=CAMERA_COLOR, tag="CrossHair"
-            )
-            self._cameraCircle2 = self.create_oval(
-                0, 0, 1, 1, outline=CAMERA_COLOR, dash=(3, 3), tag="CrossHair"
-            )
-            self.cameraPosition()
+
+        if not self._showCamera:
+            self._showCamera = True
+        
+        self.cameraPosition()
+
         try:
-            self.itemconfig(self._cameraImage, image=self.camera.toTk())
+            self.cameraImage = self.get_camera_image()
+            glActiveTexture(GL_TEXTURE0)
+            glBindTexture(GL_TEXTURE_2D, self.cameraTexture)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+                         len(self.cameraImage[0]),
+                         len(self.cameraImage),
+                         0, GL_RGBA, GL_UNSIGNED_BYTE, self.cameraImage)
+            
+            self.queueDraw()
+
         except Exception:
             pass
+
         self._cameraAfter = self.after(100, self.cameraRefresh)
 
     # -----------------------------------------------------------------------
@@ -1315,24 +2507,27 @@ class CNCCanvas(Canvas):
     # Reposition camera and crosshair
     # ----------------------------------------------------------------------
     def cameraPosition(self):
-        if self._cameraImage is None:
+        if not self._showCamera:
             return
+        
         w = self.winfo_width()
         h = self.winfo_height()
         hc, wc = self.camera.image.shape[:2]
-        wc //= 2
-        hc //= 2
-        x = w // 2  # everything on center
-        y = h // 2
-        if self.cameraAnchor is NONE:
-            if self._lastGantry is not None:
-                x, y = self.plotCoords([self._lastGantry])[0]
-            else:
-                x = y = 0
+        zoomx = self.PMatrix[0][0]
+        zoomy = self.PMatrix[1][1]
+        wc *= 0.5 / self.cameraScale * zoomx * w / 2.
+        hc *= 0.5 / self.cameraScale * zoomy * h / 2.
+        x = w / 2  # everything on center
+        y = h / 2
+
+        if self.cameraAnchor == NONE: # Center on Gantry
+            dx = dy = 0
             if not self.cameraSwitch:
-                x += self.cameraDx * self.zoom
-                y -= self.cameraDy * self.zoom
-            r = self.cameraR * self.zoom
+                dx = self.cameraDx
+                dy = self.cameraDy
+
+            x, y = self.world2Canvas(vec3(self._gantryLocation) + vec3(dx, dy, 0))
+            
         else:
             if self.cameraAnchor != CENTER:
                 if N in self.cameraAnchor:
@@ -1343,19 +2538,8 @@ class CNCCanvas(Canvas):
                     x = wc
                 elif E in self.cameraAnchor:
                     x = w - wc
-            x = self.canvasx(x)
-            y = self.canvasy(y)
-            if self.zoom / self.cameraScale > 1.0:
-                r = self.cameraR * self.zoom
-            else:
-                r = self.cameraR * self.cameraScale
-
-        self.coords(self._cameraImage, x, y)
-        self.coords(self._cameraHori, x - wc, y, x + wc, y)
-        self.coords(self._cameraVert, x, y - hc, x, y + hc)
-        self.coords(self._cameraCircle, x - r, y - r, x + r, y + r)
-        self.coords(
-            self._cameraCircle2, x - r * 2, y - r * 2, x + r * 2, y + r * 2)
+        
+        self.cameraLocation = vec2(x, y)
 
     # ----------------------------------------------------------------------
     # Crop center of camera and search it in subsequent movements
@@ -1372,283 +2556,682 @@ class CNCCanvas(Canvas):
     # ----------------------------------------------------------------------
     # Parse and draw the file from the editor to g-code commands
     # ----------------------------------------------------------------------
-    def draw(self, view=None):
-        if self._inDraw:
+    def draw(self):
+        self.make_current()
+        width, height = self.winfo_width(), self.winfo_height()
+        glViewport(0, 0, width, height)
+        
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT) # type: ignore
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glEnable(GL_DEPTH_TEST)
+        glDepthFunc(GL_LEQUAL)
+        glEnable(GL_BLEND)
+        glEnable(GL_LINE_SMOOTH)
+        glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
+        
+        # Draw background
+        self.drawBackground()
+        # Ensure that the next items are drawn on top of this
+        glClear(GL_DEPTH_BUFFER_BIT)
+
+        # Draw Camera
+        if self._showCamera:
+            self.drawCamera()
+            # Ensure that the next items are drawn on top of this
+            glClear(GL_DEPTH_BUFFER_BIT)
+            # Draw Crosshair
+            self.drawCrossHair()
+            # Ensure that the next items are drawn on top of this
+            glClear(GL_DEPTH_BUFFER_BIT)
+
+        # Draw grid
+        if self.draw_grid:
+            self.drawLines(self.gridVBO, 1)
+        
+        # Draw margins
+        if self.draw_margin:
+            self.drawLines(self.marginsVBO, 1)
+        
+        # Draw work area
+        if self.draw_workarea:
+            self.drawLines(self.workAreaVBO, 1)
+        
+        # Draw orient markers
+        glClear(GL_DEPTH_BUFFER_BIT)
+        self.drawLines(self.orientVBO, 3)
+        
+        # Draw path
+        glClear(GL_DEPTH_BUFFER_BIT)
+        if self.pathVertices.size > 0:
+            self.drawLines(self.pathVBO, 2)
+        
+        # Draw arrows
+        if len(self.pathArrows) > 0:
+            self.drawArrows(self.pathArrowsVBO)
+        
+        # Draw Snap Point
+        if self._snapPoint:
+            self.drawSnapPoint()
+        
+        # Draw probe grid, map and text
+        if self.draw_probe:
+            self.drawLines(self.probeVBO, 1)
+            self.drawProbeMap()
+            self.drawText(self.ProbeTextVBO)
+
+        # Draw info lines
+        if self.infoVertices.size > 0:
+            self.drawLines(self.infoVBO, 2)
+        
+        # Draw info arrows
+        if len(self.infoArrows) > 0:
+            self.drawArrows(self.infoArrowsVBO)
+        
+        # Draw Text
+        if len(self.text) > 0:
+            self.drawText(self.TextVBO)
+
+        # Draw axes
+        if self.draw_axes:
+            self.drawAxes()
+        
+        # Draw gantry
+        self.drawGantry()
+        
+        # Draw selection rectangle
+        if self._mouseAction == ACTION_SELECT_AREA:
+            self.drawSelectionRectangle()
+        
+        # Draw ruler
+        if self._vector:
+            self.drawLines(self.vectorVBO, 2)
+            self.drawArrows(self.vectorArrowsVBO)
+
+        glUseProgram(0)
+        
+        self.swap_buffers()
+        
+        self._drawRequested = False
+
+    def drawBackground(self):
+        glUseProgram(self.backgroundProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, self.backgroundVBO)
+        glVertexAttribPointer(glGetAttribLocation(self.backgroundProgram, "xyz"), 3, GL_FLOAT, GL_FALSE, 6*4, c_void_p(0*4))
+        glVertexAttribPointer(glGetAttribLocation(self.backgroundProgram, "color"), 3, GL_FLOAT, GL_FALSE, 6*4, c_void_p(3*4))
+        glEnableVertexAttribArray(glGetAttribLocation(self.backgroundProgram, "xyz"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.backgroundProgram, "color"))
+        glDrawArrays(GL_TRIANGLES, 0, 6)
+
+    def drawCamera(self):
+        glDisable(GL_CULL_FACE)
+        glUseProgram(self.ImageProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, self.CameraVBO)
+        PARAMETERS_PER_VERTEX = 1
+        glVertexAttribPointer(glGetAttribLocation(self.ImageProgram, "index"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glEnableVertexAttribArray(glGetAttribLocation(self.ImageProgram, "index"))
+
+        MVP = self.PMatrix * self.MVMatrix
+        mv_loc = glGetUniformLocation(program=self.ImageProgram, name="MVP")
+        glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+
+        location_loc = glGetUniformLocation(program=self.ImageProgram, name="location")
+        glUniform2fv(location_loc, 1, value_ptr(self.cameraLocation))
+
+        # Set the uniform variable 'ourTexture' to texture unit 0
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, self.cameraTexture)
+        glUniform1i(glGetUniformLocation(self.ImageProgram, "ourTexture"), 0)
+
+        width_loc = glGetUniformLocation(program=self.ImageProgram, name="width")
+        glUniform1f(width_loc, len(self.cameraImage[0]))
+
+        height_loc = glGetUniformLocation(program=self.ImageProgram, name="height")
+        glUniform1f(height_loc, len(self.cameraImage))
+
+        canvasWidth_loc = glGetUniformLocation(program=self.ImageProgram, name="canvasWidth")
+        glUniform1f(canvasWidth_loc, self.winfo_width())
+
+        canvasHeight_loc = glGetUniformLocation(program=self.ImageProgram, name="canvasHeight")
+        glUniform1f(canvasHeight_loc, self.winfo_height())
+
+        # We get the zoom from the projection matrix
+        zoomx = self.PMatrix[0][0]
+        zoomy = self.PMatrix[1][1]
+        zoom_loc = glGetUniformLocation(program=self.ImageProgram, name="zoom")
+        glUniform2f(zoom_loc, zoomx, zoomy)
+        
+        cameraScale_loc = glGetUniformLocation(program=self.ImageProgram, name="cameraScale")
+        glUniform1f(cameraScale_loc, self.cameraScale)
+
+        glDrawArrays(GL_TRIANGLES, 0, 6)
+
+    def drawCrossHair(self):
+        glUseProgram(self.CrossHairProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, self.CrossHairVBO)
+        PARAMETERS_PER_VERTEX = 1
+        glVertexAttribPointer(glGetAttribLocation(self.CrossHairProgram, "index"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glEnableVertexAttribArray(glGetAttribLocation(self.CrossHairProgram, "index"))
+
+        MVP = self.PMatrix * self.MVMatrix
+        mv_loc = glGetUniformLocation(program=self.CrossHairProgram, name="MVP")
+        glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+
+        location_loc = glGetUniformLocation(program=self.CrossHairProgram, name="location")
+        glUniform2fv(location_loc, 1, value_ptr(self.cameraLocation))
+
+        width_loc = glGetUniformLocation(program=self.CrossHairProgram, name="width")
+        glUniform1f(width_loc, len(self.cameraImage[0]))
+
+        height_loc = glGetUniformLocation(program=self.CrossHairProgram, name="height")
+        glUniform1f(height_loc, len(self.cameraImage))
+
+        canvasWidth_loc = glGetUniformLocation(program=self.CrossHairProgram, name="canvasWidth")
+        glUniform1f(canvasWidth_loc, self.winfo_width())
+
+        canvasHeight_loc = glGetUniformLocation(program=self.CrossHairProgram, name="canvasHeight")
+        glUniform1f(canvasHeight_loc, self.winfo_height())
+
+        R_loc = glGetUniformLocation(program=self.CrossHairProgram, name="R")
+        glUniform1f(R_loc, self.cameraR)
+
+        # We get the zoom from the projection matrix
+        zoomx = self.PMatrix[0][0]
+        zoomy = self.PMatrix[1][1]
+        zoom_loc = glGetUniformLocation(program=self.CrossHairProgram, name="zoom")
+        glUniform2f(zoom_loc, zoomx, zoomy)
+
+        cameraScale_loc = glGetUniformLocation(program=self.CrossHairProgram, name="cameraScale")
+        glUniform1f(cameraScale_loc, self.cameraScale)
+
+        glLineWidth(1.5)
+        size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
+        glDrawArrays(GL_LINES, 0, size // PARAMETERS_PER_VERTEX)
+    
+    def drawSnapPoint(self):
+        if self._snapPoint is None:
             return
-        self._inDraw = True
+        
+        glUseProgram(self.SnapPointProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, self.SnapPointVBO)
+        PARAMETERS_PER_VERTEX = 1
+        glVertexAttribPointer(glGetAttribLocation(self.SnapPointProgram, "index"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glEnableVertexAttribArray(glGetAttribLocation(self.SnapPointProgram, "index"))
 
-        self.__tzoom = 1.0
-        xyz = self.canvas2xyz(
-            self.canvasx(self.winfo_width() / 2),
-            self.canvasy(self.winfo_height() / 2)
-        )
+        MVP = self.PMatrix * self.MVMatrix
+        mv_loc = glGetUniformLocation(program=self.SnapPointProgram, name="MVP")
+        glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+ 
+        location_loc = glGetUniformLocation(program=self.SnapPointProgram, name="location")
+        glUniform3fv(location_loc, 1, value_ptr(self._snapPoint))
 
-        if view is not None:
-            self.view = view
+        canvasWidth_loc = glGetUniformLocation(program=self.SnapPointProgram, name="canvasWidth")
+        glUniform1f(canvasWidth_loc, self.winfo_width())
 
+        canvasHeight_loc = glGetUniformLocation(program=self.SnapPointProgram, name="canvasHeight")
+        glUniform1f(canvasHeight_loc, self.winfo_height())
+
+        glLineWidth(2)
+        size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
+        glDrawArrays(GL_LINE_LOOP, 0, size // PARAMETERS_PER_VERTEX)
+
+    def drawSelectionRectangle(self):
+        glDisable(GL_CULL_FACE)
+        glUseProgram(self.SelectionRectProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, self.SelectionRectVBO)
+        PARAMETERS_PER_VERTEX = 2
+        glVertexAttribPointer(glGetAttribLocation(self.SelectionRectProgram, "uv"), 2, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glEnableVertexAttribArray(glGetAttribLocation(self.SelectionRectProgram, "uv"))
+        
+        # Selection to the right -> Blue. To the left -> Green
+        if self.SelectionRectVertices[2] > self.SelectionRectVertices[0]:
+            rect_color = vec3(0, 0, 1)
+        else:
+            rect_color = vec3(0, 1, 0)
+        color_loc = glGetUniformLocation(program=self.SelectionRectProgram, name="color")
+        glUniform3fv(color_loc, 1, value_ptr(rect_color))
+        
+        glLineWidth(2)
+        glEnable(GL_LINE_SMOOTH)
+        glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
+        
+        glDrawArrays(GL_TRIANGLES, 0, len(self.SelectionRectVertices) // PARAMETERS_PER_VERTEX)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+    def drawLines(self, vbo, lineWidth):
+        glEnable(GL_DEPTH_TEST)
+        glUseProgram(self.linesProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, vbo)
+        PARAMETERS_PER_VERTEX = 8
+        glVertexAttribPointer(glGetAttribLocation(self.linesProgram, "id"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glVertexAttribPointer(glGetAttribLocation(self.linesProgram, "xyz"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(1*4))
+        glVertexAttribPointer(glGetAttribLocation(self.linesProgram, "pos"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(4*4))
+        glVertexAttribPointer(glGetAttribLocation(self.linesProgram, "colorValue"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(5*4))
+        glVertexAttribPointer(glGetAttribLocation(self.linesProgram, "dashRatio"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(6*4))
+        glVertexAttribPointer(glGetAttribLocation(self.linesProgram, "flags"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(7*4))
+        glEnableVertexAttribArray(glGetAttribLocation(self.linesProgram, "id"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.linesProgram, "xyz"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.linesProgram, "pos"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.linesProgram, "colorValue"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.linesProgram, "dashRatio"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.linesProgram, "flags"))
+
+
+        MVP = self.PMatrix * self.MVMatrix
+        mv_loc = glGetUniformLocation(program=self.linesProgram, name="MVP")
+        glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+
+        zoom_loc = glGetUniformLocation(program=self.linesProgram, name="zoom")
+        glUniform1f(zoom_loc, self.zoom)
+
+        glLineWidth(lineWidth)
+        size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
+        glDrawArrays(GL_LINES, 0, size // PARAMETERS_PER_VERTEX)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+    
+    def drawGantry(self):
+        glUseProgram(self.gantryProgram)
+        glEnable(GL_CULL_FACE)
+        glBindBuffer(GL_ARRAY_BUFFER, self.gantryVBO)
+        PARAMETERS_PER_VERTEX = 6
+        glVertexAttribPointer(glGetAttribLocation(self.gantryProgram, "xyz"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glVertexAttribPointer(glGetAttribLocation(self.gantryProgram, "normal"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(3*4))
+        glEnableVertexAttribArray(glGetAttribLocation(self.gantryProgram, "xyz"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.gantryProgram, "normal"))
+        
+        MVP = self.PMatrix * self.MVMatrix
+        mv_loc = glGetUniformLocation(program=self.gantryProgram, name="MVP")
+        glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+        
+        location_loc = glGetUniformLocation(program=self.gantryProgram, name="location")
+        glUniform3fv(location_loc, 1, value_ptr(self._gantryLocation))
+        
+        light1dir = normalize(inverse(MVP) * vec4(1.0, -0.25, -1.0, 0)).xyz
+        light2dir = normalize(inverse(MVP) * vec4(-0.5, -0.125, -0.5, 0)).xyz
+        
+        light1dir_loc = glGetUniformLocation(program=self.gantryProgram, name="light1dir")
+        glUniform3fv(light1dir_loc, 1, value_ptr(light1dir))
+        light2dir_loc = glGetUniformLocation(program=self.gantryProgram, name="light2dir")
+        glUniform3fv(light2dir_loc, 1, value_ptr(light2dir))
+
+        diameter = max(6., CNC.vars["diameter"])
+        diameter_loc = glGetUniformLocation(program=self.gantryProgram, name="diameter")
+        glUniform1f(diameter_loc, diameter)
+        
+        glLineWidth(2)
+        glEnable(GL_LINE_SMOOTH)
+        glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
+        size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
+        glDrawArrays(GL_TRIANGLES, 0, size // PARAMETERS_PER_VERTEX)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+    def drawArrows(self, vbo):
+        glEnable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)
+        glUseProgram(self.ArrowProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, vbo)
+        PARAMETERS_PER_VERTEX = 12
+        #glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "id"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "index"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(1*4))
+        glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "location"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(2*4))
+        glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "dir"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(5*4))
+        glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "width"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(8*4))
+        glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "height"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(9*4))
+        glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "colorValue"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(10*4))
+        glVertexAttribPointer(glGetAttribLocation(self.ArrowProgram, "flags"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(11*4))
+        #glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "id"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "index"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "location"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "dir"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "width"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "height"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "colorValue"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ArrowProgram, "flags"))
+
+
+        MVP = self.PMatrix * self.MVMatrix
+        mv_loc = glGetUniformLocation(program=self.ArrowProgram, name="MVP")
+        glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+        
+        MVPinv = inverse(MVP)
+        mvpinv_loc = glGetUniformLocation(program=self.ArrowProgram, name="MVPinv")
+        glUniformMatrix4fv(mvpinv_loc, 1, False, value_ptr(MVPinv))
+
+        zoom_loc = glGetUniformLocation(program=self.ArrowProgram, name="zoom")
+        glUniform1f(zoom_loc, self.zoom)
+
+        size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
+        glDrawArrays(GL_TRIANGLES, 0, size // PARAMETERS_PER_VERTEX)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+    
+    def drawAxes(self):
+        glDisable(GL_DEPTH_TEST)
+        glUseProgram(self.axesProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, self.axesVBO)
+        PARAMETERS_PER_VERTEX = 5
+        glVertexAttribPointer(glGetAttribLocation(self.axesProgram, "xyz"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glVertexAttribPointer(glGetAttribLocation(self.axesProgram, "position"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(3*4))
+        glVertexAttribPointer(glGetAttribLocation(self.axesProgram, "axis"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(4*4))
+        glEnableVertexAttribArray(glGetAttribLocation(self.axesProgram, "xyz"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.axesProgram, "position"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.axesProgram, "axis"))
+        
+        MVP = self.PMatrix * self.MVMatrix
+        mv_loc = glGetUniformLocation(program=self.axesProgram, name="MVP")
+        glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+        
+        zoom_loc = glGetUniformLocation(program=self.axesProgram, name="zoom")
+        glUniform1f(zoom_loc, self.zoom)
+        
+        glLineWidth(2)
+        glEnable(GL_LINE_SMOOTH)
+        glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
+        size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
+        glDrawArrays(GL_LINES, 0, size // PARAMETERS_PER_VERTEX)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+        # Draw axes text. Update text location with the current zoom
+        self.axesText[1][0] = vec3(AXIS_LENGTH / self.zoom, 0, 0)
+        self.axesText[2][0] = vec3(0, AXIS_LENGTH / self.zoom, 0)
+        self.axesText[3][0] = vec3(0, 0, AXIS_LENGTH / self.zoom)
+        self.update_text_buffer(self.AxesTextVBO, self.axesText)
+        self.drawText(self.AxesTextVBO)
+    
+    def drawText(self, textBuffer):
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)
+        glUseProgram(self.TextProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, textBuffer)
+        PARAMETERS_PER_VERTEX = 10
+        #glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "id"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "index"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(1*4))
+        glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "location"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(2*4))
+        glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "hOffset"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(5*4))
+        glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "charoffset"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(6*4))
+        glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "charwidth"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(7*4))
+        glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "charheight"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(8*4))
+        glVertexAttribPointer(glGetAttribLocation(self.TextProgram, "colorValue"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(9*4))
+        #glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "id"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "index"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "location"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "hOffset"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "charoffset"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "charwidth"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "charheight"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.TextProgram, "colorValue"))
+
+        MVP = self.PMatrix * self.MVMatrix
+        mv_loc = glGetUniformLocation(program=self.TextProgram, name="MVP")
+        glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+
+        textAtlasWidth_loc = glGetUniformLocation(program=self.TextProgram, name="textAtlasWidth")
+        glUniform1f(textAtlasWidth_loc, len(self.charTextureAtlas[0]))
+
+        canvasWidth_loc = glGetUniformLocation(program=self.TextProgram, name="canvasWidth")
+        glUniform1f(canvasWidth_loc, self.winfo_width())
+        canvasHeight_loc = glGetUniformLocation(program=self.TextProgram, name="canvasHeight")
+        glUniform1f(canvasHeight_loc, self.winfo_height())
+
+        # Set the uniform variable 'ourTexture' to texture unit 0
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, self.textTexture)
+        glUniform1i(glGetUniformLocation(self.TextProgram, "ourTexture"), 0)
+        size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
+        glDrawArrays(GL_TRIANGLES, 0, size // PARAMETERS_PER_VERTEX)
+        
+    def queueDraw(self):
+        if self._drawRequested:
+            return
+        
+        self._drawRequested = True
+        
+        self.after('idle', self.draw)
+        
+    def updateAll(self, view=None):
+
+        self.make_current()
+        
         self._last = (0.0, 0.0, 0.0)
         self.initPosition()
+        
+        self.createPaths()
+        self.pathVertices = self.update_lines_buffer(self.pathVBO, self.pathDict, True)
 
-        self.drawPaths()
-        self.drawGrid()
-        self.drawMargin()
-        self.drawWorkarea()
+        self.updateGrid()
+        self.updateMargin()
+        self.updateWorkArea()
+
         self.drawProbe()
+
         self.drawOrient()
-        self.drawAxes()
-        if self._gantry1:
-            self.tag_raise(self._gantry1)
-        if self._gantry2:
-            self.tag_raise(self._gantry2)
-        self._updateScrollBars()
-
-        ij = self.plotCoords([xyz])[0]
-        dx = int(round(self.canvasx(self.winfo_width() / 2) - ij[0]))
-        dy = int(round(self.canvasy(self.winfo_height() / 2) - ij[1]))
-        self.scan_mark(0, 0)
-        self.scan_dragto(int(round(dx)), int(round(dy)), 1)
-
-        self._inDraw = False
+        
+        self.queueDraw()
 
     # ----------------------------------------------------------------------
     # Initialize gantry position
     # ----------------------------------------------------------------------
     def initPosition(self):
-        self.configure(background=CANVAS_COLOR)
-        self.delete(ALL)
-        self._cameraImage = None
-        gr = max(3, int(CNC.vars["diameter"] / 2.0 * self.zoom))
-        if self.view == VIEW_XY:
-            self._gantry1 = self.create_oval(
-                (-gr, -gr), (gr, gr), width=2, outline=GANTRY_COLOR
-            )
-            self._gantry2 = None
-        else:
-            gx = gr
-            gy = gr // 2
-            gh = 3 * gr
-            if self.view in (VIEW_XZ, VIEW_YZ):
-                self._gantry1 = None
-                self._gantry2 = self.create_line(
-                    (-gx, -gh, 0, 0, gx, -gh, -gx, -gh),
-                    width=2, fill=GANTRY_COLOR
-                )
-            else:
-                self._gantry1 = self.create_oval(
-                    (-gx, -gh - gy, gx, -gh + gy), width=2,
-                    outline=GANTRY_COLOR
-                )
-                self._gantry2 = self.create_line(
-                    (-gx, -gh, 0, 0, gx, -gh), width=2, fill=GANTRY_COLOR
-                )
+        
+        # TODO: Anything apart from paths must be deleted...?
+        #self.delete(ALL)
+        self.pathVertices = self.deleteLines(self.pathDict, self.pathVertices, self.pathVBO)
+        self.deleteArrows(self.pathArrows, self.pathArrowsVBO)
+
+        self.updateGantry(0, 0, 0)
 
         self._lastInsert = None
         self._lastActive = None
-        self._select = None
         self._vector = None
         self._items.clear()
         self.cnc.initPath()
         self.cnc.resetAllMargins()
 
     # ----------------------------------------------------------------------
-    # Draw gantry location
+    # Update gantry location
     # ----------------------------------------------------------------------
-    def _drawGantry(self, x, y):
-        gr = max(3, int(CNC.vars["diameter"] / 2.0 * self.zoom))
-        if self._gantry2 is None:
-            self.coords(self._gantry1, (x - gr, y - gr, x + gr, y + gr))
-        else:
-            gx = gr
-            gy = gr // 2
-            gh = 3 * gr
-            if self._gantry1 is None:
-                self.coords(
-                    self._gantry2,
-                    (x - gx, y - gh, x, y, x + gx, y - gh, x - gx, y - gh),
-                )
-            else:
-                self.coords(
-                    self._gantry1, (x - gx, y - gh - gy, x + gx, y - gh + gy))
-                self.coords(
-                    self._gantry2, (x - gx, y - gh, x, y, x + gx, y - gh))
+    def updateGantry(self, x, y, z):
+        self._gantryLocation = vec3(x, y, z)
+        self.queueDraw()
+
+    def createGantry(self):
+        # Gantry geometry of diameter 1. We scale it with the actual diameter in the shader
+        gr = 0.5
+        gh = 3 * gr
+        
+        NUM_FACES = 32 # Number of faces in the whole turn of 360º
+        
+        # We create the gantry as a conical closed surface made up of triangles
+        faceAngle = 2 * math.pi / NUM_FACES
+        coneAngle = math.atan(gr / gh)
+        
+        vertices = []
+        
+        # We also calculate the normal vector for each vertex, in order to shade lights
+        
+        for f in range(NUM_FACES):
+            # Lower Cone
+            vertices.extend([
+                gr * math.cos(faceAngle * f),
+                gr * math.sin(faceAngle * f),
+                gh,
+                math.cos(coneAngle) * math.cos(faceAngle * f), math.cos(coneAngle) * math.sin(faceAngle * f), -math.sin(coneAngle)])
+            vertices.extend([
+                0, 0, 0,
+                math.cos(coneAngle) * math.cos(faceAngle * f), math.cos(coneAngle) * math.sin(faceAngle * f), -math.sin(coneAngle)]) # normal
+            vertices.extend([
+                gr * math.cos(faceAngle * (f+1)),
+                gr * math.sin(faceAngle * (f+1)),
+                gh,
+                math.cos(coneAngle) * math.cos(faceAngle * (f+1)), math.cos(coneAngle) * math.sin(faceAngle * (f+1)), -math.sin(coneAngle)])
+            # Upper Disc
+            vertices.extend([
+                0, 0, gh, 
+                0, 0, 1]) # Normal pointing upwards [0, 0, 1]
+            vertices.extend([
+                gr * math.cos(faceAngle * f),
+                gr * math.sin(faceAngle * f),
+                gh,
+                0, 0, 1])
+            vertices.extend([
+                gr * math.cos(faceAngle * (f+1)),
+                gr * math.sin(faceAngle * (f+1)),
+                gh,
+                0, 0, 1])
+        
+        gantryVertices = numpy.array(vertices, dtype=numpy.float32)
+        
+        glBindBuffer(GL_ARRAY_BUFFER, self.gantryVBO)
+        glBufferData(GL_ARRAY_BUFFER, gantryVertices.nbytes, gantryVertices, GL_STATIC_DRAW)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
 
     # ----------------------------------------------------------------------
-    # Draw system axes
+    # Create system axes
     # ----------------------------------------------------------------------
-    def drawAxes(self):
-        self.delete("Axes")
-        if not self.draw_axes:
-            return
+    def createAxes(self, axisLength):
+        
+        axesVertices = numpy.array([
+            # X axis
+            0, 0, 0, # Start Point
+            0, # position. 0 for the first point of the line and length for the second. Used for dashed lines
+            1, # Axis X
+            axisLength, 0, 0, # End Point
+            axisLength, # position. 0 for the first point of the line and length for the second. Used for dashed lines
+            1, # Axis X
+            # Y axis
+            0, 0, 0, 0, 2, 0, axisLength, 0, axisLength, 2,
+            # Z axis          
+            0, 0, 0, 0, 3, 0, 0, axisLength, axisLength, 3
+        ], dtype=numpy.float32)
+        
+        glBindBuffer(GL_ARRAY_BUFFER, self.axesVBO)
+        glBufferData(GL_ARRAY_BUFFER, axesVertices.nbytes, axesVertices, GL_STATIC_DRAW)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
 
-        dx = CNC.vars["axmax"] - CNC.vars["axmin"]
-        dy = CNC.vars["aymax"] - CNC.vars["aymin"]
-        d = min(dx, dy)
-        try:
-            s = math.pow(10.0, int(math.log10(d)))
-        except Exception:
-            if CNC.inch:
-                s = 10.0
-            else:
-                s = 100.0
-        xyz = [(0.0, 0.0, 0.0), (s, 0.0, 0.0)]
-        self.create_line(
-            self.plotCoords(xyz), tag="Axes", fill="Red",
-            dash=(3, 1), arrow=LAST
-        )
+        # Text (x, y, z)
+        self.axesText = {
+            1: [vec3(axisLength * self.zoom, 0, 0), "X", self.rgb8("White")],
+            2: [vec3(0, axisLength * self.zoom, 0), "Y", self.rgb8("White")],
+            3: [vec3(0, 0, axisLength * self.zoom), "Z", self.rgb8("White")]
+            }
+        self.update_text_buffer(self.AxesTextVBO, self.axesText)
 
-        xyz = [(0.0, 0.0, 0.0), (0.0, s, 0.0)]
-        self.create_line(
-            self.plotCoords(xyz), tag="Axes", fill="Green",
-            dash=(3, 1), arrow=LAST
-        )
+    # Update the selection rectangle
+    def updateSelectionRect(self, x1, y1, x2, y2):
+        glBindBuffer(GL_ARRAY_BUFFER, self.SelectionRectVBO)
 
-        xyz = [(0.0, 0.0, 0.0), (0.0, 0.0, s)]
-        self.create_line(
-            self.plotCoords(xyz), tag="Axes", fill="Blue",
-            dash=(3, 1), arrow=LAST
-        )
+        p1 = self.canvas2Unit(vec2(x1, y1))
+        p2 = self.canvas2Unit(vec2(x2, y2))
 
+        self.SelectionRectVertices = numpy.array(
+            [p1.x, p1.y,
+             p2.x, p1.y,
+             p2.x, p2.y,
+             p1.x, p1.y,
+             p2.x, p2.y,
+             p1.x, p2.y],
+             dtype=numpy.float32)
+        
+        glBufferData(GL_ARRAY_BUFFER, self.SelectionRectVertices.nbytes, self.SelectionRectVertices, GL_STATIC_DRAW)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+    
     # ----------------------------------------------------------------------
     # Draw margins of selected blocks
     # ----------------------------------------------------------------------
-    def drawMargin(self):
-        if self._margin:
-            self.delete(self._margin)
-        if self._amargin:
-            self.delete(self._amargin)
-        self._margin = self._amargin = None
+    def updateMargin(self):
         if not self.draw_margin:
+            self.queueDraw()
             return
+        
+        marginLines = {}
 
         if CNC.isMarginValid():
-            xyz = [
-                (CNC.vars["xmin"], CNC.vars["ymin"], 0.0),
-                (CNC.vars["xmax"], CNC.vars["ymin"], 0.0),
-                (CNC.vars["xmax"], CNC.vars["ymax"], 0.0),
-                (CNC.vars["xmin"], CNC.vars["ymax"], 0.0),
-                (CNC.vars["xmin"], CNC.vars["ymin"], 0.0),
-            ]
-            self._margin = self.create_line(self.plotCoords(xyz),
-                                            fill=MARGIN_COLOR)
-            self.tag_lower(self._margin)
+            xyz = [[CNC.vars["xmin"], CNC.vars["ymin"], 0.0],
+                [CNC.vars["xmax"], CNC.vars["ymin"], 0.0],
+                [CNC.vars["xmax"], CNC.vars["ymax"], 0.0],
+                [CNC.vars["xmin"], CNC.vars["ymax"], 0.0],
+                [CNC.vars["xmin"], CNC.vars["ymin"], 0.0]]
+        
+            self.create_line(marginLines, xyz, (255, 0, 255), 1)
+            self.update_lines_buffer(self.marginsVBO, marginLines)
 
         if not CNC.isAllMarginValid():
+            self.queueDraw()
             return
-        xyz = [
-            (CNC.vars["axmin"], CNC.vars["aymin"], 0.0),
-            (CNC.vars["axmax"], CNC.vars["aymin"], 0.0),
-            (CNC.vars["axmax"], CNC.vars["aymax"], 0.0),
-            (CNC.vars["axmin"], CNC.vars["aymax"], 0.0),
-            (CNC.vars["axmin"], CNC.vars["aymin"], 0.0),
-        ]
-        self._amargin = self.create_line(
-            self.plotCoords(xyz), dash=(3, 2), fill=MARGIN_COLOR
-        )
-        self.tag_lower(self._amargin)
-
-    # ----------------------------------------------------------------------
-    # Change rectangle coordinates
-    # ----------------------------------------------------------------------
-    def _rectCoords(self, rect, xmin, ymin, xmax, ymax, z=0.0):
-        self.coords(
-            rect,
-            tkinter._flatten(
-                self.plotCoords(
-                    [
-                        (xmin, ymin, z),
-                        (xmax, ymin, z),
-                        (xmax, ymax, z),
-                        (xmin, ymax, z),
-                        (xmin, ymin, z),
-                    ]
-                )
-            ),
-        )
-
-    # ----------------------------------------------------------------------
-    # Draw a 3D path
-    # ----------------------------------------------------------------------
-    def _drawPath(self, path, z=0.0, **kwargs):
-        xyz = []
-        for segment in path:
-            xyz.append((segment.A[0], segment.A[1], z))
-            xyz.append((segment.B[0], segment.B[1], z))
-        rect = (self.create_line(self.plotCoords(xyz), **kwargs),)
-        return rect
-
-    # ----------------------------------------------------------------------
-    # Draw a 3D rectangle
-    # ----------------------------------------------------------------------
-    def _drawRect(self, xmin, ymin, xmax, ymax, z=0.0, **kwargs):
-        xyz = [
-            (xmin, ymin, z),
-            (xmax, ymin, z),
-            (xmax, ymax, z),
-            (xmin, ymax, z),
-            (xmin, ymin, z),
-        ]
-        rect = (self.create_line(self.plotCoords(xyz), **kwargs),)
-        return rect
+        
+        xyz = [[CNC.vars["axmin"], CNC.vars["aymin"], 0.0],
+                [CNC.vars["axmax"], CNC.vars["aymin"], 0.0],
+                [CNC.vars["axmax"], CNC.vars["aymax"], 0.0],
+                [CNC.vars["axmin"], CNC.vars["aymax"], 0.0],
+                [CNC.vars["axmin"], CNC.vars["aymin"], 0.0]]
+    
+        self.create_line(marginLines, xyz, (255, 0, 255), 0.66)
+        self.update_lines_buffer(self.marginsVBO, marginLines)
+        
+        self.queueDraw()
 
     # ----------------------------------------------------------------------
     # Draw a workspace rectangle
     # ----------------------------------------------------------------------
-    def drawWorkarea(self):
-        if self._workarea:
-            self.delete(self._workarea)
+    def updateWorkArea(self):
         if not self.draw_workarea:
+            self.queueDraw()
             return
+
+        workAreaLines = {}
 
         xmin = self._dx - CNC.travel_x
         ymin = self._dy - CNC.travel_y
         xmax = self._dx
         ymax = self._dy
 
-        self._workarea = self._drawRect(
-            xmin, ymin, xmax, ymax, 0.0, fill=WORK_COLOR, dash=(3, 2)
-        )
-        self.tag_lower(self._workarea)
+        xyz = [[xmin, ymin, 0.0],
+            [xmax, ymin, 0.0],
+            [xmax, ymax, 0.0],
+            [xmin, ymax, 0.0],
+            [xmin, ymin, 0.0]]
+    
+        self.create_line(workAreaLines, xyz, (255, 165, 0), 0.661)
+        self.update_lines_buffer(self.workAreaVBO, workAreaLines)
+        
+        self.queueDraw()
 
     # ----------------------------------------------------------------------
     # Draw coordinates grid
     # ----------------------------------------------------------------------
-    def drawGrid(self):
-        self.delete("Grid")
-        if not self.draw_grid:
-            return
-        if self.view in (VIEW_XY, VIEW_ISO1, VIEW_ISO2, VIEW_ISO3):
-            xmin = (CNC.vars["axmin"] // 10) * 10
-            xmax = (CNC.vars["axmax"] // 10 + 1) * 10
-            ymin = (CNC.vars["aymin"] // 10) * 10
-            ymax = (CNC.vars["aymax"] // 10 + 1) * 10
-            for i in range(
-                int(CNC.vars["aymin"] // 10), int(CNC.vars["aymax"] // 10) + 2
-            ):
-                y = i * 10.0
-                xyz = [(xmin, y, 0), (xmax, y, 0)]
-                item = self.create_line(
-                    self.plotCoords(xyz), tag="Grid",
-                    fill=GRID_COLOR, dash=(1, 3)
-                )
-                self.tag_lower(item)
+    def updateGrid(self):
+        gridLines = {}
+        
+        xmin = (CNC.vars["axmin"] // 10) * 10
+        xmax = (CNC.vars["axmax"] // 10 + 1) * 10
+        ymin = (CNC.vars["aymin"] // 10) * 10
+        ymax = (CNC.vars["aymax"] // 10 + 1) * 10
+        
+        for i in range(
+            int(CNC.vars["aymin"] // 10), int(CNC.vars["aymax"] // 10) + 2
+        ):
+            y = i * 10.0
+            self.create_line(gridLines,
+                             [[xmin, y, 0], [xmax, y, 0]],
+                             [127, 127, 127],
+                             0.25)
 
-            for i in range(
-                int(CNC.vars["axmin"] // 10), int(CNC.vars["axmax"] // 10) + 2
-            ):
-                x = i * 10.0
-                xyz = [(x, ymin, 0), (x, ymax, 0)]
-                item = self.create_line(
-                    self.plotCoords(xyz), fill=GRID_COLOR, tag="Grid", dash=(1, 3)
-                )
-                self.tag_lower(item)
+        for i in range(
+            int(CNC.vars["axmin"] // 10), int(CNC.vars["axmax"] // 10) + 2
+        ):
+            x = i * 10.0
+            self.create_line(gridLines,
+                             [[x, ymin, 0], [x, ymax, 0]],
+                             [127, 127, 127],
+                             0.25)
+        
+        self.update_lines_buffer(self.gridVBO, gridLines)
+        
+        self.queueDraw()
 
     # ----------------------------------------------------------------------
     # Display orientation markers
     # ----------------------------------------------------------------------
     def drawOrient(self, event=None):
-        self.delete("Orient")
-        if self.view in (VIEW_XZ, VIEW_YZ):
-            return
+        self.orientDict = {}
 
         # Draw orient markers
         if CNC.inch:
@@ -1659,73 +3242,58 @@ class CNCCanvas(Canvas):
         self.gcode.orient.clearPaths()
         for i, (xm, ym, x, y) in enumerate(self.gcode.orient.markers):
             paths = []
+            
             # Machine position (cross)
-            item = self.create_line(
-                self.plotCoords([(xm - w, ym, 0.0), (xm + w, ym, 0.0)]),
-                tag="Orient",
-                fill="Green",
-            )
-            self.tag_lower(item)
+            item = self.create_line(self.orientDict,
+                [(xm - w, ym, 0.0), (xm + w, ym, 0.0)],
+                self.rgb8('Green'),
+                1.)
             paths.append(item)
 
-            item = self.create_line(
-                self.plotCoords([(xm, ym - w, 0.0), (xm, ym + w, 0.0)]),
-                tag="Orient",
-                fill="Green",
-            )
-            self.tag_lower(item)
+            item = self.create_line(self.orientDict,
+                [(xm, ym - w, 0.0), (xm, ym + w, 0.0)],
+                self.rgb8('Green'),
+                1.)
             paths.append(item)
 
             # GCode position (cross)
-            item = self.create_line(
-                self.plotCoords([(x - w, y, 0.0), (x + w, y, 0.0)]),
-                tag="Orient",
-                fill="Red",
-            )
-            self.tag_lower(item)
+            item = self.create_line(self.orientDict,
+                [(x - w, y, 0.0), (x + w, y, 0.0)],
+                self.rgb8('Red'),
+                1.)
             paths.append(item)
 
-            item = self.create_line(
-                self.plotCoords([(x, y - w, 0.0), (x, y + w, 0.0)]),
-                tag="Orient",
-                fill="Red",
-            )
-            self.tag_lower(item)
+            item = self.create_line(self.orientDict,
+                [(x, y - w, 0.0), (x, y + w, 0.0)],
+                self.rgb8('Red'),
+                1.)
             paths.append(item)
 
             # Draw error if any
             try:
                 err = self.gcode.orient.errors[i]
-                item = self.create_oval(
-                    self.plotCoords(
-                        [(xm - err, ym - err, 0.0), (xm + err, ym + err, 0.0)]
-                    ),
-                    tag="Orient",
-                    outline="Red",
-                )
-                self.tag_lower(item)
+                item = self.create_oval(self.orientDict,
+                    (xm - err, ym - err, 0.0),
+                    (xm + err, ym + err, 0.0),
+                    self.rgb8('Red'),
+                    1.)
                 paths.append(item)
 
                 err = self.gcode.orient.errors[i]
-                item = self.create_oval(
-                    self.plotCoords([(x - err, y - err, 0.0),
-                                     (x + err, y + err, 0.0)]),
-                    tag="Orient",
-                    outline="Red",
-                )
-                self.tag_lower(item)
+                item = self.create_oval(self.orientDict,
+                    (x - err, y - err, 0.0),
+                    (x + err, y + err, 0.0),
+                    self.rgb8('Red'),
+                    1.)
                 paths.append(item)
             except IndexError:
                 pass
 
             # Connecting line
-            item = self.create_line(
-                self.plotCoords([(xm, ym, 0.0), (x, y, 0.0)]),
-                tag="Orient",
-                fill="Blue",
-                dash=(1, 1),
-            )
-            self.tag_lower(item)
+            item = self.create_line(self.orientDict,
+                [(xm, ym, 0.0), (x, y, 0.0)],
+                self.rgb8('LightBlue'),
+                0.5)
             paths.append(item)
 
             self.gcode.orient.addPath(paths)
@@ -1733,21 +3301,24 @@ class CNCCanvas(Canvas):
         if self._orientSelected is not None:
             try:
                 for item in self.gcode.orient.paths[self._orientSelected]:
-                    self.itemconfig(item, width=2)
+                    self.orientDict[item][3] = FLAG_ENABLED | FLAG_SELECTED
+
             except (IndexError, TclError):
                 pass
+        
+        self.update_lines_buffer(self.orientVBO, self.orientDict)
+        
+        self.queueDraw()
 
     # ----------------------------------------------------------------------
     # Display probe
     # ----------------------------------------------------------------------
     def drawProbe(self):
-        self.delete("Probe")
+        self.probeDict = {}
         if self._probe:
-            self.delete(self._probe)
             self._probe = None
         if not self.draw_probe:
-            return
-        if self.view in (VIEW_XZ, VIEW_YZ):
+            self.queueDraw()
             return
 
         # Draw probe grid
@@ -1755,149 +3326,150 @@ class CNCCanvas(Canvas):
         for x in bmath.frange(probe.xmin, probe.xmax + 0.00001, probe.xstep()):
             xyz = [(x, probe.ymin, 0.0), (x, probe.ymax, 0.0)]
             item = self.create_line(
-                self.plotCoords(xyz), tag="Probe", fill="Yellow")
-            self.tag_lower(item)
+                self.probeDict,
+                xyz,
+                self.rgb8('Yellow'),
+                1.)
 
         for y in bmath.frange(probe.ymin, probe.ymax + 0.00001, probe.ystep()):
             xyz = [(probe.xmin, y, 0.0), (probe.xmax, y, 0.0)]
             item = self.create_line(
-                self.plotCoords(xyz), tag="Probe", fill="Yellow")
-            self.tag_lower(item)
+                self.probeDict,
+                xyz,
+                self.rgb8('Yellow'),
+                1.)
+        
+        self.update_lines_buffer(self.probeVBO, self.probeDict)
 
-        # Draw probe points
-        for i, uv in enumerate(self.plotCoords(probe.points)):
-            item = self.create_text(
-                uv,
-                text=f"{probe.points[i][2]:.{CNC.digits}f}",
-                tag="Probe",
-                justify=CENTER,
-                fill=PROBE_TEXT_COLOR,
-            )
-            self.tag_lower(item)
+        # Lines for debugging
+        """
+        probe.start = True
+        probe.makeMatrix()
+        probe.points = []
+        probe.add(500, 235, 3.7)
+        probe.add(725, 235, -2.2)
+        """
+
+        # Draw probe points text
+        # Normalize the map height to a 10% of the minimum map side
+        if probe.matrix:
+            probeMaxZ = numpy.max(probe.matrix)
+            probeMinZ = numpy.min(probe.matrix)
+            probeMaxHeight = 0.1 * min(probe.xmax - probe.xmin, probe.ymax - probe.ymin)
+            ratioZ = probeMaxHeight / max(abs(probeMaxZ), abs(probeMinZ))
+
+            self.probeText = {}
+            for i, location in enumerate(probe.points):
+                item = self.create_text(
+                    self.probeText,
+                    vec3(location[0], location[1], location[2] * ratioZ),
+                    f"{probe.points[i][2]:.{CNC.digits}f}",
+                    self.rgb8('Yellow'))
+
+            self.update_text_buffer(self.ProbeTextVBO, self.probeText)
 
         # Draw image map if numpy exists
-        if (
-            numpy is not None
-            and probe.matrix
-            and self.view in (VIEW_XY, VIEW_ISO1, VIEW_ISO2, VIEW_ISO3)
-        ):
-            array = numpy.array(list(reversed(probe.matrix)), numpy.float32)
+        if (numpy is not None and probe.matrix):
+            self.update_probe_map_buffer()
 
-            lw = array.min()
-            hg = array.max()
-            mx = max(abs(hg), abs(lw))
-            # scale should be:
-            #  -mx   .. 0 .. mx
-            #  -127     0    127
-            # -127 = light-blue
-            #    0 = white
-            #  127 = light-red
-            dc = mx / 127.0  # step in colors
-            if abs(dc) < 1e-8:
-                return
-            palette = []
-            for x in bmath.frange(lw, hg + 1e-10, (hg - lw) / 255.0):
-                i = int(math.floor(x / dc))
-                j = i + i >> 1  # 1.5*i
-                if i < 0:
-                    palette.append(0xFF + j)
-                    palette.append(0xFF + j)
-                    palette.append(0xFF)
-                elif i > 0:
-                    palette.append(0xFF)
-                    palette.append(0xFF - j)
-                    palette.append(0xFF - j)
-                else:
-                    palette.append(0xFF)
-                    palette.append(0xFF)
-                    palette.append(0xFF)
-            array = numpy.floor((array - lw) / (hg - lw) * 255)
-            self._probeImage = Image.fromarray(
-                array.astype(numpy.int16)).convert("L")
-            self._probeImage.putpalette(palette)
+        self.queueDraw()
 
-            # Add transparency for a possible composite operation latter on ISO*
-            self._probeImage = self._probeImage.convert("RGBA")
+    def drawProbeMap(self):
+        glEnable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)
+        glUseProgram(self.ProbeMapProgram)
+        glBindBuffer(GL_ARRAY_BUFFER, self.ProbeMapVBO)
+        PARAMETERS_PER_VERTEX = 4
+        glVertexAttribPointer(glGetAttribLocation(self.ProbeMapProgram, "location"), 3, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, None)
+        glVertexAttribPointer(glGetAttribLocation(self.ProbeMapProgram, "colorValue"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(3*4))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ProbeMapProgram, "location"))
+        glEnableVertexAttribArray(glGetAttribLocation(self.ProbeMapProgram, "colorValue"))
 
-            x, y = self._projectProbeImage()
+        MVP = self.PMatrix * self.MVMatrix
+        mv_loc = glGetUniformLocation(program=self.ProbeMapProgram, name="MVP")
+        glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
 
-            self._probe = self.create_image(
-                x, y, image=self._probeTkImage, anchor="sw")
-            self.tag_lower(self._probe)
+        maxZ_loc = glGetUniformLocation(program=self.ProbeMapProgram, name="maxZ")
+        glUniform1f(maxZ_loc, self.probeMaxZ)
 
-    # ----------------------------------------------------------------------
-    # Create the tkimage for the current projection
-    # ----------------------------------------------------------------------
-    def _projectProbeImage(self):
+        minZ_loc = glGetUniformLocation(program=self.ProbeMapProgram, name="minZ")
+        glUniform1f(minZ_loc, self.probeMinZ)
+
+        maxHeight_loc = glGetUniformLocation(program=self.ProbeMapProgram, name="maxHeight")
+        glUniform1f(maxHeight_loc, self.probeMaxHeight)
+
+        alpha_loc = glGetUniformLocation(program=self.ProbeMapProgram, name="alpha")
+        glUniform1f(alpha_loc, 0.5)
+
+        size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
+        glDrawArrays(GL_TRIANGLES, 0, size // PARAMETERS_PER_VERTEX)
+
+    def update_probe_map_buffer(self):
         probe = self.gcode.probe
-        size = (
-            int((probe.xmax - probe.xmin + probe._xstep) * self.zoom),
-            int((probe.ymax - probe.ymin + probe._ystep) * self.zoom),
-        )
-        marginx = int(probe._xstep / 2.0 * self.zoom)
-        marginy = int(probe._ystep / 2.0 * self.zoom)
-        crop = (marginx, marginy, size[0] - marginx, size[1] - marginy)
 
-        image = self._probeImage.resize((size), resample=RESAMPLE).crop(crop)
+        self.probeMaxZ = numpy.max(probe.matrix)
+        self.probeMinZ = numpy.min(probe.matrix)
 
-        if self.view in (VIEW_ISO1, VIEW_ISO2, VIEW_ISO3):
-            w, h = image.size
-            size2 = (int(S60 * (w + h)), int(C60 * (w + h)))
+        # Normalize the map height to a 10% of the minimum map side
+        self.probeMaxHeight = 0.1 * min(probe.xmax - probe.xmin, probe.ymax - probe.ymin)
 
-            if self.view == VIEW_ISO1:
-                transform = (
-                    0.5 / S60, 0.5 / C60, -h / 2, -0.5 / S60, 0.5 / C60, h / 2)
-                xy = self.plotCoords(
-                    [(probe.xmin, probe.ymin, 0.0),
-                     (probe.xmax, probe.ymin, 0.0)]
-                )
-                x = xy[0][0]
-                y = xy[1][1]
+        probeMapData = []
 
-            elif self.view == VIEW_ISO2:
-                transform = (
-                    0.5 / S60, -0.5 / C60, w / 2, 0.5 / S60, 0.5 / C60, -w / 2)
+        # Each quad of the map is drawn as two triangles (6 vertices)
+        for j in range(probe.yn - 1):
+            for i in range(probe.xn - 1):
+                color1 = self.blue2red(probe.matrix[j][i], self.probeMinZ, self.probeMaxZ)
+                color2 = self.blue2red(probe.matrix[j][i + 1], self.probeMinZ, self.probeMaxZ)
+                color3 = self.blue2red(probe.matrix[j + 1][i + 1], self.probeMinZ, self.probeMaxZ)
+                color4 = self.blue2red(probe.matrix[j + 1][i], self.probeMinZ, self.probeMaxZ)
+                probeMapData.extend([
+                    # Corner 1
+                    probe.xmin + i * probe.xstep(),
+                    probe.ymin + j * probe.ystep(),
+                    probe.matrix[j][i],
+                    (int(color1.x) << 16) + (int(color1.y) << 8) + int(color1.z),
+                    # Corner 2
+                    probe.xmin + (i + 1) * probe.xstep(),
+                    probe.ymin + j * probe.ystep(),
+                    probe.matrix[j][i + 1],
+                    (int(color2.x) << 16) + (int(color2.y) << 8) + int(color2.z),
+                    # Corner 3
+                    probe.xmin + (i + 1) * probe.xstep(),
+                    probe.ymin + (j + 1) * probe.ystep(),
+                    probe.matrix[j + 1][i + 1],
+                    (int(color3.x) << 16) + (int(color3.y) << 8) + int(color3.z),
+                    # Corner 1
+                    probe.xmin + i * probe.xstep(),
+                    probe.ymin + j * probe.ystep(),
+                    probe.matrix[j][i],
+                    (int(color1.x) << 16) + (int(color1.y) << 8) + int(color1.z),
+                    # Corner 3
+                    probe.xmin + (i + 1) * probe.xstep(),
+                    probe.ymin + (j + 1) * probe.ystep(),
+                    probe.matrix[j + 1][i + 1],
+                    (int(color3.x) << 16) + (int(color3.y) << 8) + int(color3.z),
+                    # Corner 4
+                    probe.xmin + i * probe.xstep(),
+                    probe.ymin + (j + 1) * probe.ystep(),
+                    probe.matrix[j + 1][i],
+                    (int(color4.x) << 16) + (int(color4.y) << 8) + int(color4.z),
+                ])
 
-                xy = self.plotCoords(
-                    [(probe.xmin, probe.ymax, 0.0),
-                     (probe.xmin, probe.ymin, 0.0)]
-                )
-                x = xy[0][0]
-                y = xy[1][1]
-            else:
-                transform = (
-                    -0.5 / S60,
-                    -0.5 / C60,
-                    w + h / 2,
-                    0.5 / S60,
-                    -0.5 / C60,
-                    h / 2,
-                )
-                xy = self.plotCoords(
-                    [(probe.xmax, probe.ymax, 0.0),
-                     (probe.xmin, probe.ymax, 0.0)]
-                )
-                x = xy[0][0]
-                y = xy[1][1]
+        probeMapVertices = numpy.array(probeMapData, dtype=numpy.float32)
 
-            affine = image.transform(
-                size2, Image.AFFINE, transform, resample=RESAMPLE)
-            # Super impose a white image
-            white = Image.new("RGBA", affine.size, (255,) * 4)
-            # compose the two images affine and white with mask the affine
-            image = Image.composite(affine, white, affine)
-            del white
+        glBindBuffer(GL_ARRAY_BUFFER, self.ProbeMapVBO)
+        glBufferData(GL_ARRAY_BUFFER, probeMapVertices.nbytes, probeMapVertices, GL_STATIC_DRAW)
 
-        else:
-            x, y = self.plotCoords([(probe.xmin, probe.ymin, 0.0)])[0]
+        glBindBuffer(GL_ARRAY_BUFFER, 0)  # Unbind the VBO
 
-        self._probeTkImage = ImageTk.PhotoImage(image)
-        return x, y
+        return probeMapVertices
 
     # ----------------------------------------------------------------------
-    # Draw the paths for the whole gcode file
+    # Create paths for the whole gcode file
     # ----------------------------------------------------------------------
-    def drawPaths(self):
+    def createPaths(self):
+        self.pathDict = {}
+
         if not self.draw_paths:
             for block in self.gcode.blocks:
                 block.resetPath()
@@ -1964,119 +3536,44 @@ class CNCCanvas(Canvas):
             if self.cnc.gcode in (1, 2, 3):
                 block.pathMargins(xyz)
                 self.cnc.pathMargins(block)
+            
+            flags = 0
+
             if block.enable:
+                flags |= FLAG_ENABLED
+
                 if self.cnc.gcode == 0 and self.draw_rapid:
                     xyz[0] = self._last
                 self._last = xyz[-1]
+
             else:
                 if self.cnc.gcode == 0:
-                    return None
-            coords = self.plotCoords(xyz)
-            if coords:
-                if block.enable:
-                    if block.color:
-                        fill = block.color
-                    else:
-                        fill = ENABLE_COLOR
-                else:
-                    fill = DISABLE_COLOR
-                if self.cnc.gcode == 0:
-                    if self.draw_rapid:
-                        return self.create_line(coords, fill=fill,
-                                                width=0, dash=(4, 3))
-                elif self.draw_paths:
+                    return None                
+
+            if block.color:
+                fill = block.color
+                
+            else:
+                fill = ENABLE_COLOR
+
+            if self.cnc.gcode == 0:
+                if self.draw_rapid:
                     return self.create_line(
-                        coords, fill=fill, width=0, cap="projecting"
-                    )
+                        self.pathDict,
+                        xyz,
+                        (255, 0, 0),
+                        0.5,
+                        flags)
+                
+            elif self.draw_paths:
+                return self.create_line(
+                    self.pathDict,
+                    xyz,
+                    self.rgb8(fill),
+                    1,
+                    flags)
+            
         return None
-
-    # ----------------------------------------------------------------------
-    # Return plotting coordinates for a 3d xyz path
-    #
-    # NOTE: Use the tkinter._flatten() to pass to self.coords() function
-    # ----------------------------------------------------------------------
-    def plotCoords(self, xyz):
-        coords = None
-        if self.view == VIEW_XY:
-            coords = [(p[0] * self.zoom, -p[1] * self.zoom) for p in xyz]
-        elif self.view == VIEW_XZ:
-            coords = [(p[0] * self.zoom, -p[2] * self.zoom) for p in xyz]
-        elif self.view == VIEW_YZ:
-            coords = [(p[1] * self.zoom, -p[2] * self.zoom) for p in xyz]
-        elif self.view == VIEW_ISO1:
-            coords = [
-                (
-                    (p[0] * S60 + p[1] * S60) * self.zoom,
-                    (+p[0] * C60 - p[1] * C60 - p[2]) * self.zoom,
-                )
-                for p in xyz
-            ]
-        elif self.view == VIEW_ISO2:
-            coords = [
-                (
-                    (p[0] * S60 - p[1] * S60) * self.zoom,
-                    (-p[0] * C60 - p[1] * C60 - p[2]) * self.zoom,
-                )
-                for p in xyz
-            ]
-        elif self.view == VIEW_ISO3:
-            coords = [
-                (
-                    (-p[0] * S60 - p[1] * S60) * self.zoom,
-                    (-p[0] * C60 + p[1] * C60 - p[2]) * self.zoom,
-                )
-                for p in xyz
-            ]
-        # Check limits
-        for i, (x, y) in enumerate(coords):
-            if abs(x) > MAXDIST or abs(y) > MAXDIST:
-                if x < -MAXDIST:
-                    x = -MAXDIST
-                elif x > MAXDIST:
-                    x = MAXDIST
-                if y < -MAXDIST:
-                    y = -MAXDIST
-                elif y > MAXDIST:
-                    y = MAXDIST
-                coords[i] = (x, y)
-        return coords
-
-    # ----------------------------------------------------------------------
-    # Canvas to real coordinates
-    # ----------------------------------------------------------------------
-    def canvas2xyz(self, i, j):
-        if self.view == VIEW_XY:
-            x = i / self.zoom
-            y = -j / self.zoom
-            z = 0
-
-        elif self.view == VIEW_XZ:
-            x = i / self.zoom
-            y = 0
-            z = -j / self.zoom
-
-        elif self.view == VIEW_YZ:
-            x = 0
-            y = i / self.zoom
-            z = -j / self.zoom
-
-        elif self.view == VIEW_ISO1:
-            x = (i / S60 + j / C60) / self.zoom / 2
-            y = (i / S60 - j / C60) / self.zoom / 2
-            z = 0
-
-        elif self.view == VIEW_ISO2:
-            x = (i / S60 - j / C60) / self.zoom / 2
-            y = -(i / S60 + j / C60) / self.zoom / 2
-            z = 0
-
-        elif self.view == VIEW_ISO3:
-            x = -(i / S60 + j / C60) / self.zoom / 2
-            y = -(i / S60 - j / C60) / self.zoom / 2
-            z = 0
-
-        return x, y, z
-
 
 # =============================================================================
 # Canvas Frame with toolbar
@@ -2103,16 +3600,14 @@ class CanvasFrame(Frame):
         toolbar = Frame(self, relief=RAISED)
         toolbar.grid(row=0, column=0, columnspan=2, sticky=EW)
 
+        # Ensure the Frame exists at the OS level before OpenGL initializes
+        self.pack(side='top', fill='both', expand=True)
+        self.update()
+
         self.canvas = CNCCanvas(self, app, takefocus=True, background="White")
         # OpenGL context
         print(f"self.canvas.winfo_id(): {self.canvas.winfo_id()}")
         self.canvas.grid(row=1, column=0, sticky=NSEW)
-        sb = Scrollbar(self, orient=VERTICAL, command=self.canvas.yview)
-        sb.grid(row=1, column=1, sticky=NS)
-        self.canvas.config(yscrollcommand=sb.set)
-        sb = Scrollbar(self, orient=HORIZONTAL, command=self.canvas.xview)
-        sb.grid(row=2, column=0, sticky=EW)
-        self.canvas.config(xscrollcommand=sb.set)
 
         self.createCanvasToolbar(toolbar)
 
@@ -2336,7 +3831,7 @@ class CanvasFrame(Frame):
             b.config(state=DISABLED)
 
         b = Button(toolbar, image=Utils.icons["refresh"],
-                   command=self.viewChange)
+                   command=self.canvas.updateAll)
         tkExtra.Balloon.set(b, _("Redraw display [Ctrl-R]"))
         b.pack(side=LEFT)
 
@@ -2358,7 +3853,43 @@ class CanvasFrame(Frame):
 
     # ----------------------------------------------------------------------
     def viewChange(self, a=None, b=None, c=None):
-        self.event_generate("<<ViewChange>>")
+        view = VIEWS.index(self.view.get())
+
+        self.canvas.MVMatrix = mat4x4(self.canvas.MVMatrix)
+
+        if view == 0:
+            self.canvas.MVMatrix = lookAt(
+                vec3(0, 0, 1),
+                vec3(0, 0, 0),
+                vec3(0, 1, 0))
+        elif view == 1:
+            self.canvas.MVMatrix = lookAt(
+                vec3(0, -1, 0),
+                vec3(0, 0, 0),
+                vec3(0, 0, 1))
+        elif view == 2:
+            self.canvas.MVMatrix = lookAt(
+                vec3(1, 0, 0),
+                vec3(0, 0, 0),
+                vec3(0, 0, 1))
+        elif view == 3:
+            self.canvas.MVMatrix = lookAt(
+                vec3(1, -1, 1),
+                vec3(0, 0, 0),
+                vec3(0, 0, 1))
+        elif view == 4:
+            self.canvas.MVMatrix = lookAt(
+                vec3(-1, -1, 1),
+                vec3(0, 0, 0),
+                vec3(0, 0, 1))
+        elif view == 5:
+            self.canvas.MVMatrix = lookAt(
+                vec3(-1, 1, 1),
+                vec3(0, 0, 0),
+                vec3(0, 0, 1))
+        
+        #self.event_generate("<<ViewChange>>")
+        self.canvas.fit2Screen()
 
     # ----------------------------------------------------------------------
     def viewXY(self, event=None):
@@ -2400,21 +3931,21 @@ class CanvasFrame(Frame):
         if value is not None:
             self.draw_axes.set(value)
         self.canvas.draw_axes = self.draw_axes.get()
-        self.canvas.drawAxes()
+        self.canvas.queueDraw()
 
     # ----------------------------------------------------------------------
     def drawGrid(self, value=None):
         if value is not None:
             self.draw_grid.set(value)
         self.canvas.draw_grid = self.draw_grid.get()
-        self.canvas.drawGrid()
+        self.canvas.updateGrid()
 
     # ----------------------------------------------------------------------
     def drawMargin(self, value=None):
         if value is not None:
             self.draw_margin.set(value)
         self.canvas.draw_margin = self.draw_margin.get()
-        self.canvas.drawMargin()
+        self.canvas.updateMargin()
 
     # ----------------------------------------------------------------------
     def drawProbe(self, value=None):
@@ -2428,7 +3959,7 @@ class CanvasFrame(Frame):
         if value is not None:
             self.draw_workarea.set(value)
         self.canvas.draw_workarea = self.draw_workarea.get()
-        self.canvas.drawWorkarea()
+        self.canvas.updateWorkArea()
 
     # ----------------------------------------------------------------------
     def drawCamera(self, value=None):
@@ -2438,6 +3969,7 @@ class CanvasFrame(Frame):
             self.canvas.cameraOn()
         else:
             self.canvas.cameraOff()
+            self.canvas.queueDraw()
 
     # ----------------------------------------------------------------------
     def drawTimeChange(self):

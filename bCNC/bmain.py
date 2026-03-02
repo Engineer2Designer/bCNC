@@ -1330,7 +1330,7 @@ class Application(Tk, Sender):
     # ----------------------------------------------------------------------
     def draw(self):
         view = CNCCanvas.VIEWS.index(self.canvasFrame.view.get())
-        self.canvas.draw(view)
+        self.canvas.updateAll(view)
         self.selectionChange()
 
     # ----------------------------------------------------------------------

@@ -1,0 +1,16 @@
+// GLSL ES 1.00
+#version 100
+precision highp float;  // Required in fragment shader
+
+vec3 GANTRY_COLOR = vec3(1.0, 0.0, 0.0);
+
+uniform vec3 light1dir;
+uniform vec3 light2dir;
+
+uniform mat4 MVP;
+
+varying vec3 normal_;
+
+void main() {
+    gl_FragColor = vec4(GANTRY_COLOR * abs(dot(normal_, light1dir) + dot(normal_, light2dir)), 0.5);
+}
