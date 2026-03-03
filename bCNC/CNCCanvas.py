@@ -202,6 +202,9 @@ class AlarmException(Exception):
 class CNCCanvas(GLCanvas):
     def rgb8(self, colorName):
         return (numpy.array(self.winfo_rgb(colorName)) * 255. / 65535.).astype(int)
+    
+    def rgb2float(self, rgb) -> float:
+        return float((int(rgb[0]) << 16) + (int(rgb[1]) << 8) + int(rgb[2]))
 
     def __init__(self, master, app, *kw, **kwargs):
         super().__init__(master) # TODO: Handle takefocus and background parameters
@@ -797,6 +800,31 @@ class CNCCanvas(GLCanvas):
 
         return vertices
     
+    def vertices_to_buffer(self, vertices, buffer):
+        glBindBuffer(GL_ARRAY_BUFFER, buffer)
+        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_DYNAMIC_DRAW)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)  # Unbind the VBO
+
+    def get_color(self, linesVertices, lineId) -> float:
+        lines16 = numpy.reshape(linesVertices, (-1, 16))
+        index = numpy.searchsorted(lines16[:, 0], lineId, side='left')
+        
+        return lines16[index, 5]
+    
+    def set_color(self, linesVertices, lineId, colorFloat, bufferToUpdate = None):
+        lines16 = numpy.reshape(linesVertices, (-1, 16))
+        firstIndex = numpy.searchsorted(lines16[:, 0], lineId, side='left')
+        lastIndex = numpy.searchsorted(lines16[:, 0], lineId, side='right')
+
+        # TODO: Check that the lineId exists...
+        lines16[firstIndex:lastIndex, [5, 13]] = colorFloat
+
+        if bufferToUpdate is not None:
+            glBindBuffer(GL_ARRAY_BUFFER, bufferToUpdate)
+            glBufferSubData(GL_ARRAY_BUFFER, firstIndex * 16 * 4, (lastIndex - firstIndex) * 16 * 4, linesVertices[firstIndex * 16:])
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+
     def update_arrows_from_lines(self, arrows, arrowsBuffer, linesVertices):
         """
         Update arrow color and flags from lines
@@ -1690,11 +1718,6 @@ class CNCCanvas(GLCanvas):
                     try:
                         items.append(self._items[i])
                     except KeyError:
-                        #  TODO: Implement
-                        tags = self.gettags(i)
-                        if "Orient" in tags:
-                            self.selectMarker(i)
-                            return
                         pass
             if items:
                 self.app.select(
