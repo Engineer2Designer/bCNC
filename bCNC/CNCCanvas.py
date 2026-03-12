@@ -121,12 +121,16 @@ TABS_COLOR = "Orange"
 WORK_COLOR = "Orange"
 CAMERA_COLOR = "Cyan"
 CANVAS_COLOR = "White"
+CANVAS_COLOR_UP = "White" # If 2 different colors are given for the backgound, a vertical gradient is shown
+CANVAS_COLOR_DOWN = "White"
+AXES_TEXT_COLOR = "Black"
 
 ENABLE_COLOR = "Black"
 DISABLE_COLOR = "LightGray"
 SELECT_COLOR = "Blue"
 SELECT2_COLOR = "DarkCyan"
 PROCESS_COLOR = "Green"
+RAPID_COLOR = ""
 
 MOVE_COLOR = "DarkCyan"
 RULER_COLOR = "White"
@@ -337,9 +341,6 @@ class CNCCanvas(GLCanvas):
         self._text_id = 1
         self.text = {} # text_id[location, text value, color]
         self.probeText = {}
-        # Background gradiend colors
-        self.bgColorUp = vec3(0.175, 0.215, 0.392)
-        self.bgColorDn = vec3(0.4, 0.4, 0.6)
         
         self.reset()
         self.initGL()
@@ -434,14 +435,7 @@ class CNCCanvas(GLCanvas):
         glUseProgram(self.backgroundProgram)      
         glBindBuffer(GL_ARRAY_BUFFER, self.backgroundVBO)
         
-        vertices = numpy.array([
-            1, 1, 0, self.bgColorUp.x, self.bgColorUp.y, self.bgColorUp.z,
-            -1, 1, 0, self.bgColorUp.x, self.bgColorUp.y, self.bgColorUp.z,
-            -1, -1, 0, self.bgColorDn.x, self.bgColorDn.y, self.bgColorDn.z,
-            1, 1, 0, self.bgColorUp.x, self.bgColorUp.y, self.bgColorUp.z,
-            -1, -1, 0, self.bgColorDn.x, self.bgColorDn.y, self.bgColorDn.z,
-            1, -1, 0, self.bgColorDn.x, self.bgColorDn.y, self.bgColorDn.z
-        ], dtype=numpy.float32)
+        vertices = numpy.array([1, 2, 3, 1, 3, 4], dtype=numpy.float32)
         
         glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_STATIC_DRAW)
         
@@ -1263,15 +1257,13 @@ class CNCCanvas(GLCanvas):
                     else:
                         self._mouseAction = ACTION_SELECT_SINGLE
                         return
-                    # fill = MOVE_COLOR
-                    fill = 'White'
+                    fill = MOVE_COLOR
                     arrow = LAST
                 except Exception:
                     self._mouseAction = ACTION_SELECT_SINGLE
                     return
             else:
-                # fill = RULER_COLOR
-                fill = 'White'
+                fill = RULER_COLOR
                 arrow = BOTH
             
             self._snapPoint = self.snapPoint(vec2(event.x, event.y))
@@ -2679,10 +2671,18 @@ class CNCCanvas(GLCanvas):
     def drawBackground(self):
         glUseProgram(self.backgroundProgram)
         glBindBuffer(GL_ARRAY_BUFFER, self.backgroundVBO)
-        glVertexAttribPointer(glGetAttribLocation(self.backgroundProgram, "xyz"), 3, GL_FLOAT, GL_FALSE, 6*4, c_void_p(0*4))
-        glVertexAttribPointer(glGetAttribLocation(self.backgroundProgram, "color"), 3, GL_FLOAT, GL_FALSE, 6*4, c_void_p(3*4))
-        glEnableVertexAttribArray(glGetAttribLocation(self.backgroundProgram, "xyz"))
-        glEnableVertexAttribArray(glGetAttribLocation(self.backgroundProgram, "color"))
+        PARAMETERS_PER_VERTEX = 1
+        glVertexAttribPointer(glGetAttribLocation(self.backgroundProgram, "index"), 1, GL_FLOAT, GL_FALSE, PARAMETERS_PER_VERTEX*4, c_void_p(0*4))
+        glEnableVertexAttribArray(glGetAttribLocation(self.backgroundProgram, "index"))
+
+        canvas_color_rgb_up = vec3(self.rgb8(CANVAS_COLOR_UP))
+        canvas_color_rgb_up_loc = glGetUniformLocation(program=self.backgroundProgram, name="canvas_color_rgb_up")
+        glUniform3fv(canvas_color_rgb_up_loc, 1, value_ptr(canvas_color_rgb_up))
+
+        canvas_color_rgb_down = vec3(self.rgb8(CANVAS_COLOR_DOWN))
+        canvas_color_rgb_down_loc = glGetUniformLocation(program=self.backgroundProgram, name="canvas_color_rgb_down")
+        glUniform3fv(canvas_color_rgb_down_loc, 1, value_ptr(canvas_color_rgb_down))
+
         glDrawArrays(GL_TRIANGLES, 0, 6)
 
     def drawCamera(self):
@@ -2846,6 +2846,20 @@ class CNCCanvas(GLCanvas):
         zoom_loc = glGetUniformLocation(program=self.linesProgram, name="zoom")
         glUniform1f(zoom_loc, self.zoom)
 
+        select_color = vec3(self.rgb8(SELECT_COLOR))
+        select_color_loc = glGetUniformLocation(program=self.linesProgram, name="selectColor")
+        glUniform3fv(select_color_loc, 1, value_ptr(select_color))
+
+        select2_color = vec3(self.rgb8(SELECT2_COLOR))
+        select2_color_loc = glGetUniformLocation(program=self.linesProgram, name="select2Color")
+        glUniform3fv(select2_color_loc, 1, value_ptr(select2_color))
+
+        disable_color = vec3(self.rgb8(DISABLE_COLOR))
+        disable_color_loc = glGetUniformLocation(program=self.linesProgram, name="disableColor")
+        glUniform3fv(disable_color_loc, 1, value_ptr(disable_color))
+
+
+
         glLineWidth(lineWidth)
         size = glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE) // 4
         glDrawArrays(GL_LINES, 0, size // PARAMETERS_PER_VERTEX)
@@ -2864,6 +2878,10 @@ class CNCCanvas(GLCanvas):
         MVP = self.PMatrix * self.MVMatrix
         mv_loc = glGetUniformLocation(program=self.gantryProgram, name="MVP")
         glUniformMatrix4fv(mv_loc, 1, False, value_ptr(MVP))
+
+        gantry_color = vec3(self.rgb8(GANTRY_COLOR))
+        gantry_color_loc = glGetUniformLocation(program=self.gantryProgram, name="gantryColor")
+        glUniform3fv(gantry_color_loc, 1, value_ptr(gantry_color))
         
         location_loc = glGetUniformLocation(program=self.gantryProgram, name="location")
         glUniform3fv(location_loc, 1, value_ptr(self._gantryLocation))
@@ -3131,9 +3149,9 @@ class CNCCanvas(GLCanvas):
 
         # Text (x, y, z)
         self.axesText = {
-            1: [vec3(axisLength * self.zoom, 0, 0), "X", self.rgb8("White")],
-            2: [vec3(0, axisLength * self.zoom, 0), "Y", self.rgb8("White")],
-            3: [vec3(0, 0, axisLength * self.zoom), "Z", self.rgb8("White")]
+            1: [vec3(axisLength * self.zoom, 0, 0), "X", self.rgb8(AXES_TEXT_COLOR)],
+            2: [vec3(0, axisLength * self.zoom, 0), "Y", self.rgb8(AXES_TEXT_COLOR)],
+            3: [vec3(0, 0, axisLength * self.zoom), "Z", self.rgb8(AXES_TEXT_COLOR)]
             }
         self.update_text_buffer(self.AxesTextVBO, self.axesText)
 
@@ -3173,7 +3191,7 @@ class CNCCanvas(GLCanvas):
                 [CNC.vars["xmin"], CNC.vars["ymax"], 0.0],
                 [CNC.vars["xmin"], CNC.vars["ymin"], 0.0]]
         
-            self.create_line(marginLines, xyz, (255, 0, 255), 1)
+            self.create_line(marginLines, xyz, self.rgb8(MARGIN_COLOR), 1)
             self.update_lines_buffer(self.marginsVBO, marginLines)
 
         if not CNC.isAllMarginValid():
@@ -3186,7 +3204,7 @@ class CNCCanvas(GLCanvas):
                 [CNC.vars["axmin"], CNC.vars["aymax"], 0.0],
                 [CNC.vars["axmin"], CNC.vars["aymin"], 0.0]]
     
-        self.create_line(marginLines, xyz, (255, 0, 255), 0.66)
+        self.create_line(marginLines, xyz, self.rgb8(MARGIN_COLOR), 0.66)
         self.update_lines_buffer(self.marginsVBO, marginLines)
         
         self.queueDraw()
@@ -3212,7 +3230,7 @@ class CNCCanvas(GLCanvas):
             [xmin, ymax, 0.0],
             [xmin, ymin, 0.0]]
     
-        self.create_line(workAreaLines, xyz, (255, 165, 0), 0.661)
+        self.create_line(workAreaLines, xyz, self.rgb8(WORK_COLOR), 0.661)
         self.update_lines_buffer(self.workAreaVBO, workAreaLines)
         
         self.queueDraw()
@@ -3234,7 +3252,7 @@ class CNCCanvas(GLCanvas):
             y = i * 10.0
             self.create_line(gridLines,
                              [[xmin, y, 0], [xmax, y, 0]],
-                             [127, 127, 127],
+                             self.rgb8(GRID_COLOR),
                              0.25)
 
         for i in range(
@@ -3243,7 +3261,7 @@ class CNCCanvas(GLCanvas):
             x = i * 10.0
             self.create_line(gridLines,
                              [[x, ymin, 0], [x, ymax, 0]],
-                             [127, 127, 127],
+                             self.rgb8(GRID_COLOR),
                              0.25)
         
         self.update_lines_buffer(self.gridVBO, gridLines)
@@ -3315,7 +3333,7 @@ class CNCCanvas(GLCanvas):
             # Connecting line
             item = self.create_line(self.orientDict,
                 [(xm, ym, 0.0), (x, y, 0.0)],
-                self.rgb8('LightBlue'),
+                self.rgb8('Blue'),
                 0.5)
             paths.append(item)
 
@@ -3387,7 +3405,7 @@ class CNCCanvas(GLCanvas):
                     self.probeText,
                     vec3(location[0], location[1], location[2] * ratioZ),
                     f"{probe.points[i][2]:.{CNC.digits}f}",
-                    self.rgb8('Yellow'))
+                    self.rgb8(PROBE_TEXT_COLOR))
 
             self.update_text_buffer(self.ProbeTextVBO, self.probeText)
 
@@ -3581,11 +3599,14 @@ class CNCCanvas(GLCanvas):
 
             if self.cnc.gcode == 0:
                 if self.draw_rapid:
+                    if RAPID_COLOR != "":
+                        fill = RAPID_COLOR
+
                     return self.create_line(
                         self.pathDict,
                         xyz,
-                        (255, 0, 0),
-                        0.5,
+                        self.rgb8(fill),
+                        0.6,
                         flags)
                 
             elif self.draw_paths:
@@ -3646,8 +3667,8 @@ class CanvasFrame(Frame):
         global INSERT_COLOR, GANTRY_COLOR, MARGIN_COLOR, GRID_COLOR
         global BOX_SELECT, ENABLE_COLOR, DISABLE_COLOR, SELECT_COLOR
         global SELECT2_COLOR, PROCESS_COLOR, MOVE_COLOR, RULER_COLOR
-        global CAMERA_COLOR, PROBE_TEXT_COLOR, CANVAS_COLOR
-        global DRAW_TIME
+        global CAMERA_COLOR, PROBE_TEXT_COLOR, CANVAS_COLOR_UP, CANVAS_COLOR_DOWN
+        global DRAW_TIME, AXES_TEXT_COLOR, RAPID_COLOR
 
         self.draw_axes.set(bool(int(Utils.getBool("Canvas", "axes", True))))
         self.draw_grid.set(bool(int(Utils.getBool("Canvas", "grid", True))))
@@ -3676,7 +3697,10 @@ class CanvasFrame(Frame):
         CAMERA_COLOR = Utils.getStr("Color", "canvas.camera", CAMERA_COLOR)
         PROBE_TEXT_COLOR = Utils.getStr(
             "Color", "canvas.probetext", PROBE_TEXT_COLOR)
-        CANVAS_COLOR = Utils.getStr("Color", "canvas.background", CANVAS_COLOR)
+        CANVAS_COLOR_UP = Utils.getStr("Color", "canvas.backgroundUp", CANVAS_COLOR_UP)
+        CANVAS_COLOR_DOWN = Utils.getStr("Color", "canvas.backgroundDown", CANVAS_COLOR_DOWN)
+        AXES_TEXT_COLOR = Utils.getStr("Color", "canvas.axestext", AXES_TEXT_COLOR)
+        RAPID_COLOR = Utils.getStr("Color", "canvas.rapid", RAPID_COLOR)
 
     # ----------------------------------------------------------------------
     def saveConfig(self):

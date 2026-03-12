@@ -2,7 +2,7 @@
 #version 100
 precision highp float;  // Required in fragment shader
 
-varying vec3 color;     // Color passed from vertex shader
+varying vec3 color_;     // Color passed from vertex shader
 varying float linePos;
 varying float dashRatio_;
 
@@ -12,7 +12,7 @@ void main() {
     float dashSize = 8.; // dash size in pixels
 
     if (mod(linePos * zoom, dashSize) <= dashRatio_ * dashSize) {
-        gl_FragColor = vec4(color, 1.0);
+        gl_FragColor = vec4(color_, 1.0);
     }
     else {
         discard;
