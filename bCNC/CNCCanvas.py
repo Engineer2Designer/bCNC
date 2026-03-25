@@ -1495,11 +1495,12 @@ class CNCCanvas(GLCanvas):
                 v12 = end - start
 
                 self.status(
-                    _("dx={:g}  dy={:g}  dz={:g}  length={:g}  angleXY={:g}").format(
+                    _("dx={:g}  dy={:g}  dz={:g}  length={:g}  dxy={:g}  angleXY={:g}").format(
                         v12.x,
                         v12.y,
                         v12.z,
                         distance(start, end),
+                        distance(vec2(v12.x, v12.y), vec2(0, 0)),
                         math.degrees(math.atan2(v12.y, v12.x)),
                     )
                 )
@@ -1540,11 +1541,12 @@ class CNCCanvas(GLCanvas):
 
                 if self._snapPoint is not None:
                     self.status(
-                        _("dx={:g}  dy={:g}  dz={:g}  length={:g}  angleXY={:g}").format(
+                        _("dx={:g}  dy={:g}  dz={:g}  length={:g}  dxy={:g}  angleXY={:g}").format(
                             v12.x,
                             v12.y,
                             v12.z,
                             distance(start, end),
+                            distance(vec2(v12.x, v12.y), vec2(0, 0)),
                             math.degrees(math.atan2(v12.y, v12.x)),
                         )
                     )
