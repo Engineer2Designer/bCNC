@@ -300,6 +300,8 @@ class CNCCanvas(GLCanvas):
         self._cameraAfter = None  # Camera anchor location "" for gantry
         self._showCamera = False
 
+        self.highlightRuler = False
+
         self.draw_axes = True  # Drawing flags
         self.draw_grid = True
         self.draw_margin = True
