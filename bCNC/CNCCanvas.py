@@ -188,7 +188,7 @@ FLAG_ENABLED = 0b10
 #FLAG_XXX = 0b100
 #FLAG_XXX = 0b1000
 
-openglFolder = f"{os.path.abspath(os.path.dirname(__file__))}{os.sep}opengl{os.sep}"
+openglFolder = f"{os.path.abspath(os.path.dirname(__file__))}{os.sep}opengl{os.sep}v100{os.sep}"
 
 # -----------------------------------------------------------------------------
 def mouseCursor(action):
@@ -347,7 +347,27 @@ class CNCCanvas(GLCanvas):
         self.probeText = {}
         
         self.reset()
-        self.initGL()
+
+        # Print OpenGL version info
+        print("========== OpenGL ==========")
+        print("OpenGL version:", glGetString(GL_VERSION))
+        print("GLSL version:", glGetString(GL_SHADING_LANGUAGE_VERSION))
+        profile_mask = glGetIntegerv(GL_CONTEXT_PROFILE_MASK)
+        print("Profile mask:", profile_mask)
+
+        # Try GLSL 1.00. If failed, change to 1.50
+        try:
+            self.initGL()
+        except Exception as e:
+            print("----------")
+            print(e)
+            print("GLSL 1.00 failed. Trying GLSL 1.50...")
+            print("----------")
+            global openglFolder
+            openglFolder = f"{os.path.abspath(os.path.dirname(__file__))}{os.sep}opengl{os.sep}v150{os.sep}"
+            self.initGL()
+        
+        print("============================")
 
         # Data of Texture atlas for text rendering
         self.charOffsetAndWidth = []
