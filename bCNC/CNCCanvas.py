@@ -58,6 +58,7 @@ from tkinter import (
     Radiobutton,
     Scrollbar,
     OptionMenu,
+    Toplevel
 )
 import tkinter
 
@@ -111,31 +112,45 @@ GANTRY_Y = GANTRY_R  # 5
 GANTRY_H = GANTRY_R * 5  # 20
 DRAW_TIME = 5  # Maximum draw time permitted
 
+# Customizable colors
+GANTRY_COLOR = DEFAULT_GANTRY_COLOR ="Red"
+MARGIN_COLOR = DEFAULT_MARGIN_COLOR = "Magenta"
+GRID_COLOR = DEFAULT_GRID_COLOR ="Gray"
+ENABLE_COLOR = DEFAULT_ENABLE_COLOR = "Black"
+DISABLE_COLOR = DEFAULT_DISABLE_COLOR = "LightGray"
+SELECT_COLOR = DEFAULT_SELECT_COLOR = "Blue"
+SELECT2_COLOR = DEFAULT_SELECT2_COLOR = "DarkCyan"
+PROCESS_COLOR = DEFAULT_PROCESS_COLOR = "Green"
+MOVE_COLOR = DEFAULT_MOVE_COLOR = "DarkCyan"
+RULER_COLOR = DEFAULT_RULER_COLOR = "Green"
+CAMERA_COLOR = DEFAULT_CAMERA_COLOR = "Cyan"
+PROBE_TEXT_COLOR = DEFAULT_PROBE_TEXT_COLOR = "Green"
+CANVAS_COLOR_UP = DEFAULT_CANVAS_COLOR_UP = "White" # If 2 different colors are given for the backgound, a vertical gradient is shown
+CANVAS_COLOR_DOWN = DEFAULT_CANVAS_COLOR_DOWN = "White"
+AXES_TEXT_COLOR = DEFAULT_AXES_TEXT_COLOR = "Black"
+RAPID_COLOR = DEFAULT_RAPID_COLOR = ""
+customColors = {
+    "canvas.gantry": {"color": "GANTRY_COLOR", "description": "Gantry", "canBeBlank": False},
+    "canvas.margin": {"color": "MARGIN_COLOR", "description": "Margin", "canBeBlank": False},
+    "canvas.grid": {"color": "GRID_COLOR", "description": "Grid", "canBeBlank": False},
+    "canvas.enable": {"color": "ENABLE_COLOR", "description": "Enabled Path (Requires Redraw)", "canBeBlank": False},
+    "canvas.disable": {"color": "DISABLE_COLOR", "description": "Disabled Path", "canBeBlank": False},
+    "canvas.select": {"color": "SELECT_COLOR", "description": "Selected Active", "canBeBlank": False},
+    "canvas.select2": {"color": "SELECT2_COLOR", "description": "Selected Inactive", "canBeBlank": False},
+    "canvas.process": {"color": "PROCESS_COLOR", "description": "Processed line", "canBeBlank": False},
+    "canvas.move": {"color": "MOVE_COLOR", "description": "Move arrow", "canBeBlank": False},
+    "canvas.ruler": {"color": "RULER_COLOR", "description": "Ruler", "canBeBlank": False},
+    "canvas.camera": {"color": "CAMERA_COLOR", "description": "Camera", "canBeBlank": False},
+    "canvas.probetext": {"color": "PROBE_TEXT_COLOR", "description": "Probe Text", "canBeBlank": False},
+    "canvas.backgroundUp": {"color": "CANVAS_COLOR_UP", "description": "Background Upper", "canBeBlank": False},
+    "canvas.backgroundDown": {"color": "CANVAS_COLOR_DOWN", "description": "Background Lower", "canBeBlank": False},
+    "canvas.axestext": {"color": "AXES_TEXT_COLOR", "description": "Axes Text (Requires App restart)", "canBeBlank": False},
+    "canvas.rapid": {"color": "RAPID_COLOR", "description": "Rapid Moves (G0) (Requires Redraw)", "canBeBlank": True}
+    }
+
+# Fixed colors
 INSERT_COLOR = "Blue"
-GANTRY_COLOR = "Red"
-MARGIN_COLOR = "Magenta"
-GRID_COLOR = "Gray"
-BOX_SELECT = "Cyan"
-TAB_COLOR = "DarkOrange"
-TABS_COLOR = "Orange"
 WORK_COLOR = "Orange"
-CAMERA_COLOR = "Cyan"
-CANVAS_COLOR = "White"
-CANVAS_COLOR_UP = "White" # If 2 different colors are given for the backgound, a vertical gradient is shown
-CANVAS_COLOR_DOWN = "White"
-AXES_TEXT_COLOR = "Black"
-
-ENABLE_COLOR = "Black"
-DISABLE_COLOR = "LightGray"
-SELECT_COLOR = "Blue"
-SELECT2_COLOR = "DarkCyan"
-PROCESS_COLOR = "Green"
-RAPID_COLOR = ""
-
-MOVE_COLOR = "DarkCyan"
-RULER_COLOR = "White"
-PROBE_TEXT_COLOR = "Green"
-
 INFO_COLOR = "Gold"
 
 ACTION_SELECT = 0
@@ -213,6 +228,8 @@ class CNCCanvas(GLCanvas):
 
     def __init__(self, master, app, *kw, **kwargs):
         super().__init__(master) # TODO: Handle takefocus and background parameters
+        
+        self.parentFrame : Frame = master
 
         profile = 'legacy' # Opengl 2.1
 
@@ -2000,7 +2017,11 @@ class CNCCanvas(GLCanvas):
                 C1, C2, dist, intersect = self.closest_points_between_lines(p1, p2, start, end)
                 return C2, 0
 
-
+    def setCustomColors(self):
+        dialog = CustomColorsDialog(self.parentFrame, self)
+        dialog.transient(self.parentFrame)
+        self.wait_window(dialog)  # makes it modal-like
+        self.queueDraw()
     # ----------------------------------------------------------------------
     def configureEvent(self, event):
         width = self.winfo_width()
@@ -3845,7 +3866,7 @@ class CanvasFrame(Frame):
     # ----------------------------------------------------------------------
     def loadConfig(self):
         global INSERT_COLOR, GANTRY_COLOR, MARGIN_COLOR, GRID_COLOR
-        global BOX_SELECT, ENABLE_COLOR, DISABLE_COLOR, SELECT_COLOR
+        global ENABLE_COLOR, DISABLE_COLOR, SELECT_COLOR
         global SELECT2_COLOR, PROCESS_COLOR, MOVE_COLOR, RULER_COLOR
         global CAMERA_COLOR, PROBE_TEXT_COLOR, CANVAS_COLOR_UP, CANVAS_COLOR_DOWN
         global DRAW_TIME, AXES_TEXT_COLOR, RAPID_COLOR
@@ -3863,24 +3884,22 @@ class CanvasFrame(Frame):
         DRAW_TIME = Utils.getInt("Canvas", "drawtime", DRAW_TIME)
 
         INSERT_COLOR = Utils.getStr("Color", "canvas.insert", INSERT_COLOR)
-        GANTRY_COLOR = Utils.getStr("Color", "canvas.gantry", GANTRY_COLOR)
-        MARGIN_COLOR = Utils.getStr("Color", "canvas.margin", MARGIN_COLOR)
-        GRID_COLOR = Utils.getStr("Color", "canvas.grid", GRID_COLOR)
-        BOX_SELECT = Utils.getStr("Color", "canvas.selectbox", BOX_SELECT)
-        ENABLE_COLOR = Utils.getStr("Color", "canvas.enable", ENABLE_COLOR)
-        DISABLE_COLOR = Utils.getStr("Color", "canvas.disable", DISABLE_COLOR)
-        SELECT_COLOR = Utils.getStr("Color", "canvas.select", SELECT_COLOR)
-        SELECT2_COLOR = Utils.getStr("Color", "canvas.select2", SELECT2_COLOR)
-        PROCESS_COLOR = Utils.getStr("Color", "canvas.process", PROCESS_COLOR)
-        MOVE_COLOR = Utils.getStr("Color", "canvas.move", MOVE_COLOR)
-        RULER_COLOR = Utils.getStr("Color", "canvas.ruler", RULER_COLOR)
-        CAMERA_COLOR = Utils.getStr("Color", "canvas.camera", CAMERA_COLOR)
-        PROBE_TEXT_COLOR = Utils.getStr(
-            "Color", "canvas.probetext", PROBE_TEXT_COLOR)
-        CANVAS_COLOR_UP = Utils.getStr("Color", "canvas.backgroundUp", CANVAS_COLOR_UP)
-        CANVAS_COLOR_DOWN = Utils.getStr("Color", "canvas.backgroundDown", CANVAS_COLOR_DOWN)
-        AXES_TEXT_COLOR = Utils.getStr("Color", "canvas.axestext", AXES_TEXT_COLOR)
-        RAPID_COLOR = Utils.getStr("Color", "canvas.rapid", RAPID_COLOR)
+        GANTRY_COLOR = Utils.getStr("Color", "canvas.gantry", DEFAULT_GANTRY_COLOR)
+        MARGIN_COLOR = Utils.getStr("Color", "canvas.margin", DEFAULT_MARGIN_COLOR)
+        GRID_COLOR = Utils.getStr("Color", "canvas.grid", DEFAULT_GRID_COLOR)
+        ENABLE_COLOR = Utils.getStr("Color", "canvas.enable", DEFAULT_ENABLE_COLOR)
+        DISABLE_COLOR = Utils.getStr("Color", "canvas.disable", DEFAULT_DISABLE_COLOR)
+        SELECT_COLOR = Utils.getStr("Color", "canvas.select", DEFAULT_SELECT_COLOR)
+        SELECT2_COLOR = Utils.getStr("Color", "canvas.select2", DEFAULT_SELECT2_COLOR)
+        PROCESS_COLOR = Utils.getStr("Color", "canvas.process", DEFAULT_PROCESS_COLOR)
+        MOVE_COLOR = Utils.getStr("Color", "canvas.move", DEFAULT_MOVE_COLOR)
+        RULER_COLOR = Utils.getStr("Color", "canvas.ruler", DEFAULT_RULER_COLOR)
+        CAMERA_COLOR = Utils.getStr("Color", "canvas.camera", DEFAULT_CAMERA_COLOR)
+        PROBE_TEXT_COLOR = Utils.getStr("Color", "canvas.probetext", DEFAULT_PROBE_TEXT_COLOR)
+        CANVAS_COLOR_UP = Utils.getStr("Color", "canvas.backgroundUp", DEFAULT_CANVAS_COLOR_UP)
+        CANVAS_COLOR_DOWN = Utils.getStr("Color", "canvas.backgroundDown", DEFAULT_CANVAS_COLOR_DOWN)
+        AXES_TEXT_COLOR = Utils.getStr("Color", "canvas.axestext", DEFAULT_AXES_TEXT_COLOR)
+        RAPID_COLOR = Utils.getStr("Color", "canvas.rapid", DEFAULT_RAPID_COLOR)
 
     # ----------------------------------------------------------------------
     def saveConfig(self):
@@ -3893,6 +3912,12 @@ class CanvasFrame(Frame):
         Utils.setBool("Canvas", "paths", self.draw_paths.get())
         Utils.setBool("Canvas", "rapid", self.draw_rapid.get())
         Utils.setBool("Canvas", "workarea", self.draw_workarea.get())
+
+        # Save Canvas Colors
+        global customColors
+
+        for c in customColors:
+            Utils.setStr("Color", c, globals()[customColors[c]["color"]])
 
     # ----------------------------------------------------------------------
     # Canvas toolbar FIXME XXX should be moved to CNCCanvas
@@ -4062,6 +4087,11 @@ class CanvasFrame(Frame):
         tkExtra.Balloon.set(b, _("Redraw display [Ctrl-R]"))
         b.pack(side=LEFT)
 
+        b = Button(toolbar, image=Utils.icons["color"],
+                   command=self.canvas.setCustomColors)
+        tkExtra.Balloon.set(b, _("Set Canvas colors"))
+        b.pack(side=LEFT)
+
         # -----------
         self.drawTime = tkExtra.Combobox(
             toolbar, width=3, background="White", command=self.drawTimeChange
@@ -4206,3 +4236,95 @@ class CanvasFrame(Frame):
         except ValueError:
             DRAW_TIME = 5 * 60
         self.viewChange()
+
+class CustomColorsDialog(Toplevel):
+    def __init__(self, parent, canvas):
+        super().__init__(parent)
+
+        global customColors
+
+        self.canvas = canvas
+        self.title("Canvas Colors")
+
+        # Make it modal
+        self.transient(parent)     # keep on top of parent
+        self.grab_set()            # block interaction with parent
+        
+        self.buttons = {}
+
+        # List of customizable colors
+        for c in customColors:
+            item = Frame(self)
+            item.pack(fill="x", padx=10, pady=2)
+            labelText = customColors[c]["description"]
+            if customColors[c]["canBeBlank"]:
+                labelText = labelText + " - Right click to unset"
+            Label(item, text=labelText).pack(side="left")
+            buttonFrame = Frame(item, width=16, height=16)
+            buttonFrame.pack_propagate(False)
+            buttonFrame.pack(side="right")
+            currentColor = globals()[customColors[c]["color"]]
+            # We use labels as buttons. Buttons have some rendering issues when updating colors
+            if currentColor != "":
+                self.buttons[c] = Label(buttonFrame, bg=currentColor, height=16, width=16)
+            else:
+                self.buttons[c] = Label(buttonFrame, bg="White", text="x")
+            self.buttons[c].pack(fill="both")
+            self.buttons[c].bind("<Button-1>", lambda event, var=c: self.colorLeftClicked(var))
+            if customColors[c]["canBeBlank"]:
+                self.buttons[c].bind("<Button-3>", lambda event, var=c: self.colorRightClicked(var))
+
+        Button(self, text="Set Default Colors", command=self.setDefaultColors).pack(pady=10)
+        Button(self, text="Close", command=self.destroy).pack(pady=10)
+
+        # Optional: center the window
+        self.update_idletasks()
+        x = parent.winfo_rootx() + 50
+        y = parent.winfo_rooty() + 50
+        self.geometry(f"+{x}+{y}")
+    
+    def colorLeftClicked(self, varName):
+        global customColors
+
+        currentColor = globals()[customColors[varName]["color"]]
+
+        if currentColor != "":
+            initialColor = currentColor
+        else:
+            initialColor = "Black"
+
+        rgb, color = tkExtra.askcolor(title="Color",
+            initialcolor=initialColor,
+            parent = self
+            )
+    
+        if color is not None:
+            globals()[customColors[varName]["color"]] = color
+            self.buttons[varName].config(bg=color)
+            self.buttons[varName].config(text="")
+            self.canvas.queueDraw()
+    
+    def colorRightClicked(self, varName):
+        global customColors
+
+        currentColor = globals()[customColors[varName]["color"]]
+        globals()[customColors[varName]["color"]] = ""
+        self.buttons[varName].config(bg="White")
+        self.buttons[varName].config(text="x")
+
+        self.canvas.queueDraw()
+
+    def setDefaultColors(self):
+        global customColors
+
+        for c in customColors:
+            defaultColor = globals()["DEFAULT_" + customColors[c]["color"]]
+            globals()[customColors[c]["color"]] = defaultColor
+
+            if defaultColor != "":
+                self.buttons[c].config(bg=defaultColor)
+            else:
+                self.buttons[c].config(bg="White")
+                self.buttons[c].config(text="x")
+        
+        self.canvas.queueDraw()
