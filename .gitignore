@@ -13,3 +13,4 @@ build
 
 flatpak/builddir
 flatpak/.flatpak-builder
+.venv

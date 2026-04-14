@@ -369,7 +369,14 @@ class CNCCanvas(GLCanvas):
         print("========== OpenGL ==========")
         print("OpenGL version:", glGetString(GL_VERSION))
         print("GLSL version:", glGetString(GL_SHADING_LANGUAGE_VERSION))
-        profile_mask = glGetIntegerv(GL_CONTEXT_PROFILE_MASK)
+        profile_mask = 0
+        try:
+            major = glGetIntegerv(GL_MAJOR_VERSION)
+            minor = glGetIntegerv(GL_MINOR_VERSION)
+            if (major, minor) >= (3, 2):
+                profile_mask = glGetIntegerv(GL_CONTEXT_PROFILE_MASK)
+        except Exception:
+            profile_mask = 0
         print("Profile mask:", profile_mask)
 
         # Try GLSL 1.00. If failed, change to 1.50
