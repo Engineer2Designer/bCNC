@@ -30,6 +30,10 @@ You can use any of these commands (you need only one):
     pip install . #in git directory
     python -m pip install --upgrade bCNC
 
+    pip install PyOpenGL PyOpenGL_accelerate
+    pip install opencv-contrib-python
+    
+
 This is how you launch bCNC:
 
     python -m bCNC
