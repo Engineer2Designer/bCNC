@@ -1253,8 +1253,10 @@ class CNCCanvas(GLCanvas):
         # Proyect the canvas cx, cy point to the world xy plane
         if clickedPoint is None:
             uv = self.canvas2WorldXY(vec2(x, y))
+        elif clickedPoint[0] is not None:
+            uv = vec2(clickedPoint[0].x, clickedPoint[0].y)
         else:
-            uv = vec2(clickedPoint.x, clickedPoint.y)
+            uv = self.canvas2WorldXY(vec2(x, y))
 
         if uv is None:
             self.status(
